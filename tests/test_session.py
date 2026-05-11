@@ -1,0 +1,248 @@
+"""Tests for Willow's durable session records."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from willow import session
+from willow.providers import (
+    Message,
+    RedactedThinkingBlock,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+
+
+def _sample_record() -> session.SessionRecord:
+    return session.SessionRecord(
+        metadata=session.SessionMetadata(
+            id="sess_123",
+            created_at="2026-05-08T10:00:00Z",
+            updated_at="2026-05-08T10:00:00Z",
+            title="debug run",
+            cwd="/tmp/project",
+        ),
+        settings=session.SessionSettings(
+            provider="openai_responses",
+            model="gpt-5.5",
+            system="Be concise.",
+            max_tokens=2048,
+            max_iterations=7,
+        ),
+        messages=[
+            Message(
+                role="user",
+                content=[TextBlock(text="Run the test suite.")],
+            ),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(
+                        thinking="I should inspect the project first.",
+                        signature="sig_1",
+                        encrypted_content="enc_1",
+                    ),
+                    ToolUseBlock(
+                        id="toolu_1",
+                        name="bash",
+                        input={"command": "pytest", "timeout": 120},
+                    ),
+                ],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="toolu_1",
+                        content="1 passed",
+                        is_error=False,
+                    ),
+                    TextBlock(text="Now summarize."),
+                ],
+            ),
+            Message(
+                role="assistant",
+                content=[
+                    RedactedThinkingBlock(data="opaque-redacted-payload"),
+                    TextBlock(text="Tests passed."),
+                ],
+                input_tokens=100,
+                output_tokens=12,
+                cached_tokens=80,
+            ),
+        ],
+    )
+
+
+def test_session_record_round_trips_through_json_file(tmp_path: Path) -> None:
+    record = _sample_record()
+    path = tmp_path / "nested" / "session.json"
+
+    saved_path = session.save_session(record, path)
+    loaded = session.load_session(saved_path)
+
+    assert saved_path == path
+    assert loaded.metadata.id == record.metadata.id
+    assert loaded.metadata.created_at == record.metadata.created_at
+    assert loaded.metadata.updated_at.endswith("Z")
+    assert loaded.settings == record.settings
+    assert loaded.messages == record.messages
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == session.SCHEMA_VERSION
+    assert raw["metadata"]["title"] == "debug run"
+    assert raw["settings"] == {
+        "provider": "openai_responses",
+        "model": "gpt-5.5",
+        "system": "Be concise.",
+        "max_tokens": 2048,
+        "max_iterations": 7,
+    }
+    assert raw["messages"][1]["content"][0] == {
+        "type": "thinking",
+        "thinking": "I should inspect the project first.",
+        "signature": "sig_1",
+        "encrypted_content": "enc_1",
+    }
+    assert raw["messages"][3]["input_tokens"] == 100
+    assert raw["messages"][3]["output_tokens"] == 12
+    assert raw["messages"][3]["cached_tokens"] == 80
+    assert raw["messages"][3]["content"][0] == {
+        "type": "redacted_thinking",
+        "data": "opaque-redacted-payload",
+    }
+
+
+def test_message_and_content_block_helpers_are_explicit() -> None:
+    message = Message(
+        role="assistant",
+        content=[
+            TextBlock(text="hello"),
+            ToolUseBlock(id="call_1", name="read", input={"path": "README.md"}),
+        ],
+    )
+
+    encoded = session.message_to_dict(message)
+
+    assert encoded == {
+        "role": "assistant",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "content": [
+            {"type": "text", "text": "hello"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "read",
+                "input": {"path": "README.md"},
+            },
+        ],
+    }
+    assert session.message_from_dict(encoded) == message
+
+
+def test_save_session_replaces_existing_file_via_same_directory_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _sample_record()
+    path = tmp_path / "session.json"
+    path.write_text("old data", encoding="utf-8")
+
+    calls: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def spy_replace(
+        src: str | bytes | os.PathLike[str],
+        dst: str | bytes | os.PathLike[str],
+    ) -> None:
+        src_path = Path(src)
+        dst_path = Path(dst)
+        assert src_path.parent == path.parent
+        assert src_path.name.startswith(f".{path.name}.")
+        assert src_path.name.endswith(".tmp")
+        assert dst_path == path
+        assert json.loads(src_path.read_text(encoding="utf-8"))["metadata"]["id"] == "sess_123"
+        calls.append((src_path, dst_path))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(session.os, "replace", spy_replace)
+
+    session.save_session(record, path)
+
+    assert calls
+    assert session.load_session(path).metadata.id == "sess_123"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_default_session_path_uses_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(session.SESSION_DIR_ENV, str(tmp_path / "sessions"))
+
+    assert session.default_session_dir() == tmp_path / "sessions"
+    assert session.default_session_path("abc-123") == tmp_path / "sessions" / "abc-123.json"
+
+
+def test_default_session_path_rejects_path_traversal() -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        session.default_session_path("../outside")
+
+
+def test_new_session_captures_settings_and_empty_history(tmp_path: Path) -> None:
+    record = session.new_session(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        system=None,
+        max_tokens=512,
+        max_iterations=3,
+        title="investigation",
+        cwd=str(tmp_path),
+    )
+
+    assert record.metadata.title == "investigation"
+    assert record.metadata.cwd == str(tmp_path)
+    assert record.settings == session.SessionSettings(
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        system=None,
+        max_tokens=512,
+        max_iterations=3,
+    )
+    assert record.messages == []
+
+
+def test_load_rejects_unknown_schema_version(tmp_path: Path) -> None:
+    path = tmp_path / "session.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 999,
+                "metadata": {},
+                "settings": {},
+                "messages": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="schema_version"):
+        session.load_session(path)
+
+
+def test_load_rejects_unknown_content_block_type() -> None:
+    with pytest.raises(ValueError, match="unsupported content block type"):
+        session.content_block_from_dict({"type": "image", "url": "https://example.test/x.png"})
+
+
+def test_load_rejects_invalid_message_role() -> None:
+    with pytest.raises(ValueError, match="unsupported message role"):
+        session.message_from_dict({"role": "system", "content": []})

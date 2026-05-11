@@ -1,0 +1,502 @@
+"""Tests for willow.auth.
+
+These tests redirect ``willow.auth.AUTH_PATH`` at a per-test ``tmp_path`` so
+they never read or write the real ``~/.willow/auth.json``.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path
+
+import pytest
+
+from willow import auth
+
+
+@pytest.fixture
+def auth_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point willow.auth.AUTH_PATH at tmp_path/auth.json and return the path."""
+    path = tmp_path / "auth.json"
+    monkeypatch.setattr(auth, "AUTH_PATH", path)
+    monkeypatch.setattr(auth, "CODEX_AUTH_PATH", tmp_path / "codex-auth.json")
+    return path
+
+
+def _jwt_with_exp(exp: int) -> str:
+    def encode(payload: dict[str, object]) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    return f"{encode({'alg': 'none'})}.{encode({'exp': exp})}.signature"
+
+
+# ---------------------------------------------------------------------------
+# AUTH_PATH constant
+# ---------------------------------------------------------------------------
+
+
+def test_auth_path_default_is_home_dotwillow_auth_json() -> None:
+    """The unpatched constants must resolve to documented auth paths."""
+    # Re-import to be safe; the module attribute should equal the documented path.
+    assert Path.home() / ".willow" / "auth.json" == auth.AUTH_PATH
+    assert Path.home() / ".codex" / "auth.json" == auth.CODEX_AUTH_PATH
+
+
+def test_auth_path_is_monkeypatchable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The contract requires AUTH_PATH be overridable via monkeypatch.setattr."""
+    new = tmp_path / "elsewhere.json"
+    monkeypatch.setattr(auth, "AUTH_PATH", new)
+    assert new == auth.AUTH_PATH
+
+
+# ---------------------------------------------------------------------------
+# load_auth + get_api_key happy path
+# ---------------------------------------------------------------------------
+
+
+def test_get_api_key_returns_anthropic_and_openai(auth_file: Path) -> None:
+    auth_file.write_text(
+        json.dumps(
+            {
+                "anthropic": {"api_key": {"api_key": "sk-ant-abc123"}},
+                "openai": {"api_key": {"api_key": "sk-openai-xyz789"}},
+            }
+        )
+    )
+    assert auth.get_api_key("anthropic") == "sk-ant-abc123"
+    assert auth.get_api_key("openai") == "sk-openai-xyz789"
+
+
+def test_get_credential_returns_api_key_metadata(auth_file: Path) -> None:
+    auth_file.write_text(
+        json.dumps({"openai": {"api_key": {"api_key": "sk-openai-xyz789"}}})
+    )
+
+    credential = auth.get_credential("openai")
+
+    assert credential.kind == "api_key"
+    assert credential.bearer_token == "sk-openai-xyz789"
+    assert credential.source == f"{auth_file} openai.api_key"
+    assert credential.expires_at is None
+
+
+def test_get_credential_returns_openai_oauth_from_willow(auth_file: Path) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "openai": {
+                    "oauth": {
+                        "access_token": token,
+                    }
+                }
+            }
+        )
+    )
+
+    credential = auth.get_credential("openai")
+
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == token
+    assert credential.source == f"{auth_file} openai.oauth"
+    assert credential.expires_at == 2_000_000_000
+
+
+def test_get_credential_uses_oauth_by_default_when_both_methods_exist(
+    auth_file: Path,
+) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "example": {
+                    "api_key": {"api_key": "sk-example-existing"},
+                    "oauth": {"access_token": token},
+                }
+            }
+        )
+    )
+
+    credential = auth.get_credential("example")
+
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == token
+    assert credential.source == f"{auth_file} example.oauth"
+
+
+def test_get_credential_accepts_legacy_explicit_oauth_over_api_key(
+    auth_file: Path,
+) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "openai": {
+                    "auth_type": "oauth",
+                    "api_key": "sk-openai-existing",
+                    "access_token": token,
+                }
+            }
+        )
+    )
+
+    credential = auth.get_credential("openai")
+
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == token
+
+
+def test_get_api_key_returns_oauth_access_token_for_compatibility(auth_file: Path) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+    auth_file.write_text(
+        json.dumps({"openai": {"oauth": {"access_token": token}}})
+    )
+
+    assert auth.get_api_key("openai") == token
+
+
+def test_get_credential_falls_back_to_codex_oauth_when_willow_missing(
+    auth_file: Path,
+) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+    auth.CODEX_AUTH_PATH.write_text(json.dumps({"tokens": {"access_token": token}}))
+
+    credential = auth.get_credential("openai")
+
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == token
+    assert credential.source == f"{auth.CODEX_AUTH_PATH} tokens"
+    assert credential.expires_at == 2_000_000_000
+
+
+def test_get_credential_falls_back_to_codex_oauth_when_openai_missing(
+    auth_file: Path,
+) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+    auth_file.write_text(json.dumps({"anthropic": {"api_key": "sk-ant-abc"}}))
+    auth.CODEX_AUTH_PATH.write_text(json.dumps({"tokens": {"access_token": token}}))
+
+    credential = auth.get_credential("openai")
+
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == token
+
+
+def test_get_credential_rejects_expired_oauth_token(auth_file: Path) -> None:
+    auth_file.write_text(
+        json.dumps(
+            {
+                "openai": {
+                    "oauth": {
+                        "access_token": _jwt_with_exp(1),
+                    }
+                }
+            }
+        )
+    )
+
+    with pytest.raises(KeyError, match="refresh_token"):
+        auth.get_credential("openai")
+
+
+def test_get_credential_refreshes_expired_oauth_for_any_provider(
+    auth_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_token = _jwt_with_exp(1)
+    new_token = _jwt_with_exp(2_000_000_000)
+    calls: list[dict[str, object]] = []
+
+    def fake_refresh(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"access_token": new_token, "expires_in": 3600}
+
+    monkeypatch.setattr(auth, "_request_oauth_refresh", fake_refresh)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "example": {
+                    "oauth": {
+                        "access_token": old_token,
+                        "refresh_token": "refresh-existing",
+                        "token_url": "https://provider.example/oauth/token",
+                        "client_id": "example-client",
+                    }
+                }
+            }
+        )
+    )
+
+    credential = auth.get_credential("example")
+    saved = json.loads(auth_file.read_text(encoding="utf-8"))
+
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == new_token
+    assert saved["example"]["oauth"]["access_token"] == new_token
+    assert saved["example"]["oauth"]["refresh_token"] == "refresh-existing"
+    assert calls == [
+        {
+            "token_url": "https://provider.example/oauth/token",
+            "refresh_token": "refresh-existing",
+            "client_id": "example-client",
+            "client_secret": None,
+            "scope": None,
+        }
+    ]
+
+
+def test_get_credential_refreshes_near_expiry_oauth(
+    auth_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_token = _jwt_with_exp(int(auth.time.time()) + 10)
+    new_token = _jwt_with_exp(2_000_000_000)
+
+    monkeypatch.setattr(
+        auth,
+        "_request_oauth_refresh",
+        lambda **_kwargs: {
+            "access_token": new_token,
+            "refresh_token": "refresh-rotated",
+        },
+    )
+    auth_file.write_text(
+        json.dumps(
+            {
+                "example": {
+                    "oauth": {
+                        "access_token": old_token,
+                        "refresh_token": "refresh-existing",
+                        "token_url": "https://provider.example/oauth/token",
+                        "client_id": "example-client",
+                    }
+                }
+            }
+        )
+    )
+
+    credential = auth.get_credential("example")
+    saved = json.loads(auth_file.read_text(encoding="utf-8"))
+
+    assert credential.bearer_token == new_token
+    assert saved["example"]["oauth"]["refresh_token"] == "refresh-rotated"
+
+
+def test_get_credential_does_not_refresh_unexpired_oauth(
+    auth_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = _jwt_with_exp(2_000_000_000)
+
+    def fail_refresh(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("refresh should not be called")
+
+    monkeypatch.setattr(auth, "_request_oauth_refresh", fail_refresh)
+    auth_file.write_text(json.dumps({"example": {"oauth": {"access_token": token}}}))
+
+    assert auth.get_credential("example").bearer_token == token
+
+
+def test_get_credential_refreshes_openai_with_provider_defaults(
+    auth_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_token = _jwt_with_exp(1)
+    new_token = _jwt_with_exp(2_000_000_000)
+    seen: dict[str, object] = {}
+
+    def fake_refresh(**kwargs: object) -> dict[str, object]:
+        seen.update(kwargs)
+        return {"access_token": new_token}
+
+    monkeypatch.setattr(auth, "_request_oauth_refresh", fake_refresh)
+    auth_file.write_text(
+        json.dumps(
+            {
+                "openai": {
+                    "oauth": {
+                        "access_token": old_token,
+                        "refresh_token": "refresh-existing",
+                    }
+                }
+            }
+        )
+    )
+
+    credential = auth.get_credential("openai")
+
+    assert credential.bearer_token == new_token
+    assert seen["token_url"] == "https://auth.openai.com/oauth/token"
+    assert seen["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann"
+
+
+def test_auth_credential_repr_hides_bearer_token() -> None:
+    credential = auth.AuthCredential(
+        kind="oauth",
+        bearer_token="secret-token",
+        source="test",
+    )
+
+    assert "secret-token" not in repr(credential)
+
+
+def test_load_auth_returns_full_dict(auth_file: Path) -> None:
+    payload = {
+        "anthropic": {"api_key": {"api_key": "sk-ant-abc"}},
+        "openai": {"api_key": {"api_key": "sk-oai"}},
+    }
+    auth_file.write_text(json.dumps(payload))
+    assert auth.load_auth() == payload
+
+
+def test_get_api_key_tolerates_extra_fields_under_vendor(auth_file: Path) -> None:
+    """Future fields like org_id/base_url must not break api_key retrieval."""
+    auth_file.write_text(
+        json.dumps(
+            {
+                "anthropic": {
+                    "api_key": {
+                        "api_key": "sk-ant-abc",
+                        "base_url": "https://example.com",
+                    }
+                },
+                "openai": {
+                    "api_key": {
+                        "api_key": "sk-oai",
+                        "org_id": "org-123",
+                    }
+                },
+            }
+        )
+    )
+    assert auth.get_api_key("anthropic") == "sk-ant-abc"
+    assert auth.get_api_key("openai") == "sk-oai"
+
+
+# ---------------------------------------------------------------------------
+# Missing file
+# ---------------------------------------------------------------------------
+
+
+def test_load_auth_missing_file_raises_filenotfound_with_path(auth_file: Path) -> None:
+    assert not auth_file.exists()
+    with pytest.raises(FileNotFoundError) as excinfo:
+        auth.load_auth()
+    msg = str(excinfo.value)
+    assert str(auth_file) in msg
+    # Message should hint at the expected JSON shape (actionable).
+    assert "anthropic" in msg
+    assert "api_key" in msg
+
+
+def test_get_api_key_missing_file_raises_filenotfound_with_path(auth_file: Path) -> None:
+    with pytest.raises(FileNotFoundError) as excinfo:
+        auth.get_api_key("anthropic")
+    assert str(auth_file) in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Vendor not in file
+# ---------------------------------------------------------------------------
+
+
+def test_get_api_key_vendor_not_present_raises_keyerror(auth_file: Path) -> None:
+    auth_file.write_text(json.dumps({"anthropic": {"api_key": "sk-ant-abc"}}))
+    with pytest.raises(KeyError) as excinfo:
+        auth.get_api_key("openai")
+    # KeyError stringifies with quotes around the message; check the args[0].
+    msg = excinfo.value.args[0]
+    assert "openai" in msg
+    assert str(auth_file) in msg
+
+
+# ---------------------------------------------------------------------------
+# Vendor present but no api_key
+# ---------------------------------------------------------------------------
+
+
+def test_get_api_key_missing_api_key_field_raises_keyerror(auth_file: Path) -> None:
+    auth_file.write_text(json.dumps({"anthropic": {"org_id": "org-123"}}))
+    with pytest.raises(KeyError) as excinfo:
+        auth.get_api_key("anthropic")
+    msg = excinfo.value.args[0]
+    assert "anthropic" in msg
+    assert "api_key" in msg
+    assert str(auth_file) in msg
+
+
+def test_get_api_key_empty_string_api_key_raises_keyerror(auth_file: Path) -> None:
+    auth_file.write_text(json.dumps({"anthropic": {"api_key": ""}}))
+    with pytest.raises(KeyError) as excinfo:
+        auth.get_api_key("anthropic")
+    msg = excinfo.value.args[0]
+    assert "anthropic" in msg
+    assert str(auth_file) in msg
+
+
+def test_get_api_key_non_string_api_key_raises_keyerror(auth_file: Path) -> None:
+    auth_file.write_text(json.dumps({"anthropic": {"api_key": 12345}}))
+    with pytest.raises(KeyError) as excinfo:
+        auth.get_api_key("anthropic")
+    assert "anthropic" in excinfo.value.args[0]
+
+
+def test_get_api_key_vendor_entry_not_object_raises_keyerror(auth_file: Path) -> None:
+    auth_file.write_text(json.dumps({"anthropic": "sk-ant-abc"}))
+    with pytest.raises(KeyError) as excinfo:
+        auth.get_api_key("anthropic")
+    assert "anthropic" in excinfo.value.args[0]
+
+
+# ---------------------------------------------------------------------------
+# Malformed JSON / wrong top-level shape
+# ---------------------------------------------------------------------------
+
+
+def test_load_auth_malformed_json_raises_valueerror_with_path(auth_file: Path) -> None:
+    auth_file.write_text("{not valid json")
+    with pytest.raises(ValueError) as excinfo:
+        auth.load_auth()
+    msg = str(excinfo.value)
+    assert str(auth_file) in msg
+    # Helpful: indicate it's a JSON problem.
+    assert "JSON" in msg or "json" in msg
+
+
+def test_load_auth_top_level_not_object_raises_valueerror(auth_file: Path) -> None:
+    auth_file.write_text(json.dumps(["anthropic", "openai"]))
+    with pytest.raises(ValueError) as excinfo:
+        auth.load_auth()
+    msg = str(excinfo.value)
+    assert str(auth_file) in msg
+    assert "object" in msg or "dict" in msg.lower()
+
+
+def test_get_api_key_malformed_json_propagates_valueerror(auth_file: Path) -> None:
+    auth_file.write_text("garbage")
+    with pytest.raises(ValueError):
+        auth.get_api_key("anthropic")
+
+
+# ---------------------------------------------------------------------------
+# willow package does not eagerly import auth
+# ---------------------------------------------------------------------------
+
+
+def test_importing_willow_does_not_auto_load_auth() -> None:
+    """`import willow` must not read the auth file (no side effects)."""
+    import importlib
+    import sys
+
+    # Drop any cached references so we re-execute willow/__init__.py.
+    for name in list(sys.modules):
+        if name == "willow" or name.startswith("willow."):
+            del sys.modules[name]
+
+    willow = importlib.import_module("willow")
+    # The package should not have eagerly bound `auth` as an attribute.
+    assert not hasattr(willow, "auth")

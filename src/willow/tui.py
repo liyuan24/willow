@@ -1,0 +1,2039 @@
+"""Willow's native terminal chat UI.
+
+The main transcript is append-only stdout. Willow never enters the alternate
+screen, never owns terminal scrollback, and never repaints old conversation
+history. That is the key difference from the previous app-owned transcript:
+native terminal scrollback remains the source of truth.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import queue
+import select
+import shutil
+import sys
+import termios
+import textwrap
+import threading
+import tty
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, TextIO, cast
+
+from willow.loop import dispatch_tool
+from willow.message_history import interrupted_user_text_blocks, queued_user_text_blocks
+from willow.models import (
+    ModelChoice,
+    available_model_choices,
+    find_model_choice,
+    render_model_choices,
+)
+from willow.permissions import (
+    PermissionAnswer,
+    PermissionGate,
+    PermissionMode,
+    tool_permission_summary,
+)
+from willow.providers import (
+    CompletionRequest,
+    CompletionResponse,
+    Message,
+    Provider,
+    StreamComplete,
+    TextBlock,
+    TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
+    ToolResultBlock,
+    ToolUseBlock,
+    ToolUseDelta,
+)
+from willow.session import (
+    SessionEntry,
+    SessionRecord,
+    SessionSettings,
+    default_session_path,
+    list_sessions,
+    load_session,
+    new_session,
+    resolve_session_path,
+    save_session,
+)
+from willow.skills import (
+    expand_skill_invocation,
+    load_available_skills,
+    render_skill_suggestions,
+)
+from willow.system_prompt import build_system_prompt
+from willow.tools import TOOLS_BY_NAME
+from willow.turns import append_turn_step, build_turn_step
+
+with contextlib.suppress(ImportError):
+    import readline  # noqa: F401
+
+SLASH_COMMAND_HINTS: tuple[tuple[str, str], ...] = (
+    ("/clear", "reset conversation history"),
+    ("/exit", "exit the TUI"),
+    ("/help", "show commands and settings"),
+    ("/model", "choose what model to use"),
+    ("/quit", "exit the TUI"),
+    ("/session", "show persistence and saved session path"),
+    ("/status", "show session and status details"),
+    ("/statusline", "toggle status snapshots in the prompt"),
+)
+BUILTIN_SLASH_COMMANDS = frozenset(command for command, _description in SLASH_COMMAND_HINTS)
+
+MODEL_CONTEXT_TOKENS: dict[str, int] = {
+    "gpt-5.5": 1_050_000,
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.3-codex": 400_000,
+    "gpt-5.3-codex-spark": 400_000,
+    "gpt-5.2": 400_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-opus-4-6": 200_000,
+    "claude-haiku-4-6": 200_000,
+}
+
+RESET = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+USER_STYLE = "\x1b[48;5;24;38;5;231m"
+ASSISTANT_STYLE = "\x1b[38;5;255m"
+THINKING_STYLE = "\x1b[38;5;245;3m"
+TOOL_STYLE = "\x1b[48;5;58;38;5;230m"
+TOOL_DOT_STYLE = "\x1b[38;5;82;1m"
+TOOL_TITLE_STYLE = "\x1b[38;5;255;1m"
+TOOL_PREVIEW_STYLE = "\x1b[38;5;245m"
+DIFF_ADD_STYLE = "\x1b[48;5;22;38;5;231m"
+DIFF_DELETE_STYLE = "\x1b[48;5;52;38;5;231m"
+DIFF_META_STYLE = "\x1b[38;5;245m"
+SEPARATOR_STYLE = "\x1b[38;5;240m"
+ERROR_TEXT_STYLE = "\x1b[38;5;203;1m"
+WELCOME_BORDER_STYLE = "\x1b[38;5;244m"
+WELCOME_LOGO_STYLE = "\x1b[38;5;107;1m"
+WELCOME_TITLE_STYLE = "\x1b[38;5;255;1m"
+WELCOME_LABEL_STYLE = "\x1b[38;5;245m"
+WELCOME_VALUE_STYLE = "\x1b[38;5;255;1m"
+STATUS_STYLE = "\x1b[48;5;238;38;5;250m"
+STATUS_MODEL_STYLE = "\x1b[48;5;238;38;5;82;1m"
+STATUS_TOKEN_STYLE = "\x1b[48;5;238;38;5;203;1m"
+PROMPT_STYLE = "\x1b[48;5;23;38;5;231m"
+ERROR_STYLE = "\x1b[48;5;52;38;5;231m"
+PROMPT_MARKER_STYLE = "\x1b[48;5;23;38;5;51;1m"
+SELECTED_ROW_STYLE = "\x1b[48;5;240;38;5;255;1m"
+
+WILLOW_LOGO_LINES: tuple[str, ...] = (
+    "   \\ | /   ",
+    " ~~ \\|/ ~~ ",
+    "     Y     ",
+)
+WELCOME_TITLE = "Willow Agent"
+
+
+def _abbreviate(content: str, limit: int = 200) -> str:
+    flat = content.replace("\n", " ").strip()
+    return flat if len(flat) <= limit else flat[:limit] + "..."
+
+
+def _compact_lines(content: str, *, max_lines: int = 4, max_width: int = 110) -> list[str]:
+    lines = [line.rstrip() for line in content.splitlines()]
+    if not lines:
+        return []
+    selected = lines[:max_lines]
+    rendered = [
+        line if len(line) <= max_width else line[: max_width - 3] + "..."
+        for line in selected
+    ]
+    omitted = len(lines) - len(selected)
+    if omitted > 0:
+        rendered.append(f"... +{omitted} lines")
+    return rendered
+
+
+def _tool_action_title(block: ToolUseBlock, *, is_error: bool = False) -> str:
+    if is_error:
+        return f"{block.name} error"
+    if block.name == "bash":
+        return f"bash ok - ran {_tool_arg(block, 'command', '<missing command>')}"
+    if block.name == "read":
+        path = _tool_arg(block, "path", "<missing path>")
+        offset = block.input.get("offset")
+        limit = block.input.get("limit")
+        if offset is not None and limit is not None:
+            return f"read ok - {path} lines {offset}-{int(offset) + int(limit) - 1}"
+        if offset is not None:
+            return f"read ok - {path} from line {offset}"
+        return f"read ok - {path}"
+    if block.name == "grep":
+        pattern = _tool_arg(block, "pattern", "<missing pattern>")
+        path = _tool_arg(block, "path", ".")
+        glob = block.input.get("glob")
+        scope = f"{path} ({glob})" if glob else path
+        return f"grep ok - {scope} for {pattern}"
+    if block.name == "write":
+        return f"write ok - {_tool_arg(block, 'path', '<missing path>')}"
+    if block.name == "edit":
+        return f"edit ok - {_tool_arg(block, 'path', '<missing path>')}"
+    return f"{block.name} ok"
+
+
+def _tool_edit_title(block: ToolUseBlock, *, path: str, added: int, deleted: int) -> str:
+    if block.name == "edit":
+        verb = "edited"
+    elif deleted == 0:
+        verb = "added"
+    else:
+        verb = "wrote"
+    return f"{block.name} ok - {verb} {path} (+{added} -{deleted})"
+
+
+def _tool_arg(block: ToolUseBlock, name: str, default: str) -> str:
+    value = block.input.get(name, default)
+    text = str(value)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def _diff_counts(diff_lines: list[str]) -> tuple[int, int]:
+    added = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+    deleted = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+    return added, deleted
+
+
+def _diff_preview_lines(diff_lines: list[str], *, max_changes: int = 12) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    old_line = 0
+    new_line = 0
+    shown_changes = 0
+    omitted_changes = 0
+    for line in diff_lines:
+        if line.startswith("@@"):
+            parts = line.split()
+            if len(parts) >= 3:
+                old_line = _parse_hunk_start(parts[1])
+                new_line = _parse_hunk_start(parts[2])
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("+"):
+            shown_changes, omitted_changes = _append_diff_row(
+                rows,
+                shown_changes=shown_changes,
+                omitted_changes=omitted_changes,
+                max_changes=max_changes,
+                kind="add",
+                line=f"{new_line:>5} +{line[1:]}",
+            )
+            new_line += 1
+        elif line.startswith("-"):
+            shown_changes, omitted_changes = _append_diff_row(
+                rows,
+                shown_changes=shown_changes,
+                omitted_changes=omitted_changes,
+                max_changes=max_changes,
+                kind="delete",
+                line=f"{old_line:>5} -{line[1:]}",
+            )
+            old_line += 1
+        elif line.startswith(" "):
+            old_line += 1
+            new_line += 1
+    if omitted_changes:
+        rows.append(("meta", f"... +{omitted_changes} changed lines"))
+    return rows
+
+
+def _append_diff_row(
+    rows: list[tuple[str, str]],
+    *,
+    shown_changes: int,
+    omitted_changes: int,
+    max_changes: int,
+    kind: str,
+    line: str,
+) -> tuple[int, int]:
+    if shown_changes < max_changes:
+        rows.append((kind, line))
+        shown_changes += 1
+    else:
+        omitted_changes += 1
+    return shown_changes, omitted_changes
+
+
+def _parse_hunk_start(token: str) -> int:
+    value = token[1:].split(",", 1)[0]
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def _format_tokens(tokens: int) -> str:
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M tok"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.1f}k tok"
+    return f"{tokens} tok"
+
+
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _estimate_content_block_tokens(block: object) -> int:
+    if isinstance(block, TextBlock):
+        return _estimate_text_tokens(block.text)
+    if isinstance(block, ToolResultBlock):
+        return _estimate_text_tokens(block.tool_use_id) + _estimate_text_tokens(block.content)
+    if isinstance(block, ToolUseBlock):
+        return (
+            _estimate_text_tokens(block.id)
+            + _estimate_text_tokens(block.name)
+            + _estimate_text_tokens(json.dumps(block.input, sort_keys=True, default=str))
+        )
+    if isinstance(block, ThinkingBlock):
+        return (
+            _estimate_text_tokens(block.thinking)
+            + _estimate_text_tokens(block.signature or "")
+            + _estimate_text_tokens(block.encrypted_content or "")
+        )
+    data = getattr(block, "data", None)
+    if isinstance(data, str):
+        return _estimate_text_tokens(data)
+    return _estimate_text_tokens(str(block))
+
+
+def _estimate_request_context_tokens(
+    *,
+    system: str | None,
+    messages: list[Message],
+    tools: list[dict[str, object]],
+) -> int:
+    total = _estimate_text_tokens(system or "")
+    for message in messages:
+        total += 4 + _estimate_text_tokens(message.role)
+        total += sum(_estimate_content_block_tokens(block) for block in message.content)
+    for tool in tools:
+        total += _estimate_text_tokens(json.dumps(tool, sort_keys=True, default=str))
+    return total
+
+
+def _render_statusline(
+    *,
+    model: str,
+    context_tokens: int | None,
+    context_window: int | None,
+    input_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+    cwd: str,
+) -> str:
+    prefix = f"{model} | Context"
+    if context_tokens is None:
+        context_tokens = 0
+    if context_window is None:
+        usage = f"{prefix} unknown ({_format_tokens(context_tokens)})"
+    else:
+        percent = (context_tokens / context_window) * 100 if context_window else 0
+        usage = (
+            f"{prefix} {percent:.1f}% used "
+            f"({_format_tokens(context_tokens)} / {_format_tokens(context_window)})"
+        )
+    if input_tokens > 0 or output_tokens > 0:
+        usage = (
+            f"{usage} | input: {_format_tokens(input_tokens)} | "
+            f"cached total: {_format_tokens(cached_tokens)} | "
+            f"output: {_format_tokens(output_tokens)}"
+        )
+    return f"{usage} | cwd: {cwd}"
+
+
+def _cached_tokens_from_usage(usage: dict[str, int]) -> int:
+    for key in ("cached_tokens", "cache_read_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def _style_statusline_text(text: str) -> str:
+    """Apply statusline segment colors without changing visible text."""
+    separator = " | "
+    first_sep = text.find(separator)
+    if first_sep > 0:
+        text = (
+            f"{STATUS_MODEL_STYLE}{text[:first_sep]}{STATUS_STYLE}"
+            f"{text[first_sep:]}"
+        )
+
+    context_start = text.find("Context")
+    if context_start == -1:
+        return text
+
+    cwd_start = text.find(" | cwd:", context_start)
+    if cwd_start == -1:
+        cwd_start = len(text.rstrip())
+
+    return (
+        f"{text[:context_start]}"
+        f"{STATUS_TOKEN_STYLE}{text[context_start:cwd_start]}{STATUS_STYLE}"
+        f"{text[cwd_start:]}"
+    )
+
+
+def _context_window_for_model(model: str) -> int | None:
+    if model in MODEL_CONTEXT_TOKENS:
+        return MODEL_CONTEXT_TOKENS[model]
+    if model.startswith("gpt-"):
+        return 400_000
+    if model.startswith("claude-"):
+        return 200_000
+    return None
+
+
+def _render_command_hints(value: str) -> str:
+    stripped = value.strip()
+    if not stripped.startswith("/"):
+        return ""
+    prefix = stripped.split(maxsplit=1)[0]
+    matches = [
+        f"{command}  {description}"
+        for command, description in SLASH_COMMAND_HINTS
+        if command.startswith(prefix)
+    ]
+    return "\n".join(matches)
+
+
+def _render_input_hints(value: str, cwd: str | Path | None = None) -> str:
+    rows: list[str] = []
+    command_hints = _render_command_hints(value)
+    if command_hints:
+        rows.extend(command_hints.splitlines())
+    skill_hints = render_skill_suggestions(value, cwd or Path.cwd())
+    if skill_hints:
+        rows.extend(skill_hints.splitlines())
+    return "\n".join(rows)
+
+
+def _hint_command(row: str) -> str:
+    return row.split(maxsplit=1)[0]
+
+
+def _render_model_picker_rows(
+    choices: list[ModelChoice],
+    *,
+    current_model: str,
+    selected_index: int,
+    width: int,
+    styles_enabled: bool,
+) -> list[str]:
+    if not choices:
+        text = " No models available. Add openai or anthropic auth to ~/.willow/auth.json."
+        return [f"{STATUS_STYLE}{text[:width].ljust(width)}{RESET}" if styles_enabled else text]
+
+    model_width = max(len(choice.model) for choice in choices)
+    rows: list[str] = []
+    for index, choice in enumerate(choices):
+        marker = ">" if index == selected_index else " "
+        current = " current" if choice.model == current_model else ""
+        line = f" {marker} {choice.model:<{model_width}}{current:<8}  {choice.description}"
+        line = line[:width].ljust(width)
+        if styles_enabled and index == selected_index:
+            rows.append(f"{SELECTED_ROW_STYLE}{line}{RESET}")
+        elif styles_enabled:
+            rows.append(f"{STATUS_STYLE}{line}{RESET}")
+        else:
+            rows.append(line)
+    return rows
+
+
+def _render_input_hint_rows(
+    rows: list[str],
+    *,
+    selected_index: int,
+    width: int,
+    styles_enabled: bool,
+) -> list[str]:
+    rendered: list[str] = []
+    for index, row in enumerate(rows):
+        line = f" {row}"[:width].ljust(width)
+        if styles_enabled and index == selected_index:
+            rendered.append(f"{SELECTED_ROW_STYLE}{line}{RESET}")
+        elif styles_enabled:
+            rendered.append(f"{STATUS_STYLE}{line}{RESET}")
+        else:
+            rendered.append(line)
+    return rendered
+
+
+def _apply_hint_to_input(
+    buffer: str,
+    hint_row: str,
+    *,
+    append_space_when_empty: bool = False,
+) -> str:
+    selected_command = _hint_command(hint_row)
+    stripped = buffer.strip()
+    if not stripped:
+        return f"{selected_command} " if append_space_when_empty else selected_command
+    parts = stripped.split(maxsplit=1)
+    rest = f" {parts[1]}" if len(parts) == 2 else ""
+    if not rest and append_space_when_empty:
+        rest = " "
+    return f"{selected_command}{rest}"
+
+
+def _strip_control(text: str) -> str:
+    return text.replace("\r", "\\r").replace("\n", "\\n")
+
+
+def _display_cwd(path: Path | None = None) -> str:
+    cwd = path or Path.cwd()
+    home = Path.home()
+    try:
+        return f"~/{cwd.relative_to(home)}"
+    except ValueError:
+        return str(cwd)
+
+
+def _short_session_id(entry: SessionEntry) -> str:
+    return entry.record.metadata.id or entry.path.stem
+
+
+def _session_label(entry: SessionEntry) -> str:
+    metadata = entry.record.metadata
+    title = metadata.title or _first_user_text(entry.record) or "(untitled)"
+    return (
+        f"{_short_session_id(entry):<12} "
+        f"{entry.record.settings.model:<18} "
+        f"{len(entry.record.messages):>3} msgs  "
+        f"{metadata.updated_at}  "
+        f"{title}"
+    )
+
+
+def _first_user_text(record: SessionRecord, *, limit: int = 48) -> str | None:
+    for message in record.messages:
+        if message.role != "user":
+            continue
+        for block in message.content:
+            if isinstance(block, TextBlock) and block.text.strip():
+                text = " ".join(block.text.split())
+                return text if len(text) <= limit else text[: limit - 3] + "..."
+    return None
+
+
+def _history_ends_with_tool_results(messages: list[Message]) -> bool:
+    if not messages:
+        return False
+    last = messages[-1]
+    return last.role == "user" and any(
+        isinstance(block, ToolResultBlock) for block in last.content
+    )
+
+
+def _wrap_terminal_line(line: str, width: int) -> list[str]:
+    return textwrap.wrap(
+        line,
+        width=max(1, width),
+        break_long_words=True,
+        break_on_hyphens=False,
+        drop_whitespace=False,
+        replace_whitespace=False,
+    ) or [""]
+
+
+class WillowApp:
+    """Append-only native terminal session for Willow."""
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        provider: Provider,
+        *,
+        inline_mode: bool = True,
+        state: dict[str, object] | None = None,
+        input_func: Callable[[str], str] | None = None,
+        out: TextIO | None = None,
+    ) -> None:
+        self.args = args
+        self.provider = provider
+        self.inline_mode = inline_mode
+        self.input_func = input_func or input
+        self.out = out or sys.stdout
+
+        self.current_provider_name: str = args.provider
+        self.current_model: str = args.model
+        self.max_tokens: int = args.max_tokens
+        self.max_iterations: int = args.max_iterations
+        self.messages: list[Message] = []
+        self.tool_specs = [tool.spec() for tool in TOOLS_BY_NAME.values()]
+        self.permission_mode: PermissionMode = getattr(
+            args,
+            "permission_mode",
+            PermissionMode.YOLO,
+        )
+        self.permission_gate = PermissionGate(
+            self.permission_mode,
+            prompt=self._ask_tool_permission,
+        )
+        self.system: str | None = build_system_prompt(
+            tools_by_name=TOOLS_BY_NAME,
+            skills=load_available_skills(Path.cwd()),
+            permission_mode=self.permission_mode,
+        )
+
+        self._statusline_enabled = True
+        self._last_context_tokens: int | None = None
+        self._total_input_tokens = 0
+        self._total_cached_tokens = 0
+        self._total_output_tokens = 0
+        self._session_record: SessionRecord | None = None
+        self._session_path: Path | None = None
+        self._force_plain = input_func is not None or out is not None
+        self._last_transcript_was_separator = False
+        self._resume_history_pending = False
+
+        if state is not None:
+            self._restore_state(state)
+
+        if bool(getattr(args, "persist_session", False)):
+            resume_record = cast(
+                SessionRecord | None,
+                getattr(args, "_resume_session_record", None),
+            )
+            resume_path = cast(Path | None, getattr(args, "_resume_session_path", None))
+            if resume_record is not None:
+                self._session_record = resume_record
+                self._session_path = resume_path or default_session_path(resume_record.metadata.id)
+                self._resume_history_pending = bool(resume_record.messages)
+            else:
+                self._session_record = new_session(
+                    provider=self.current_provider_name,
+                    model=self.current_model,
+                    system=self.system,
+                    max_tokens=self.max_tokens,
+                    max_iterations=self.max_iterations,
+                )
+                self._session_path = default_session_path(self._session_record.metadata.id)
+            self._persist_session()
+
+    def run(self, **_ignored_app_kwargs: Any) -> int:
+        """Run until EOF, KeyboardInterrupt, /exit, or /quit."""
+        if self._can_run_live():
+            return self._run_live()
+        return self._run_basic()
+
+    def _run_basic(self) -> int:
+        """Portable append-only loop used for tests and non-TTY stdio."""
+        self._write_welcome_card()
+        self._write_resume_history_if_pending()
+        self._continue_resumed_turn_if_needed()
+        while True:
+            try:
+                user_input = self.input_func(self._prompt())
+            except EOFError:
+                self._write_line("")
+                break
+            except KeyboardInterrupt:
+                self._write_line("")
+                break
+
+            text = user_input.strip()
+            if not text:
+                continue
+            expanded_text = self._expand_skill_text(text)
+            if expanded_text is None and text.startswith("/"):
+                if self._handle_slash(text):
+                    break
+                continue
+
+            self._write_block(text, USER_STYLE)
+            self.messages.append(
+                Message(role="user", content=[TextBlock(text=expanded_text or text)])
+            )
+            self._persist_session()
+            self._run_turn()
+
+        self._write_line("Goodbye.")
+        return 0
+
+    def _can_run_live(self) -> bool:
+        return (
+            not self._force_plain
+            and hasattr(sys.stdin, "isatty")
+            and sys.stdin.isatty()
+            and hasattr(self.out, "isatty")
+            and self.out.isatty()
+        )
+
+    def _run_live(self) -> int:
+        terminal = _LiveTerminal(self)
+        return terminal.run()
+
+    def snapshot_state(self) -> dict[str, object]:
+        return {
+            "current_provider_name": self.current_provider_name,
+            "current_model": self.current_model,
+            "system": self.system,
+            "max_tokens": self.max_tokens,
+            "max_iterations": self.max_iterations,
+            "permission_mode": self.permission_mode,
+            "messages": list(self.messages),
+            "statusline_enabled": self._statusline_enabled,
+            "last_context_tokens": self._last_context_tokens,
+            "total_input_tokens": self._total_input_tokens,
+            "total_cached_tokens": self._total_cached_tokens,
+            "total_output_tokens": self._total_output_tokens,
+        }
+
+    def _restore_state(self, state: dict[str, object]) -> None:
+        self.current_provider_name = str(
+            state.get("current_provider_name", self.current_provider_name)
+        )
+        self.current_model = str(state.get("current_model", self.current_model))
+        self.system = cast(str | None, state.get("system", self.system))
+        self.max_tokens = int(cast(Any, state.get("max_tokens", self.max_tokens)))
+        self.max_iterations = int(
+            cast(Any, state.get("max_iterations", self.max_iterations))
+        )
+        self.permission_mode = cast(
+            PermissionMode,
+            state.get("permission_mode", self.permission_mode),
+        )
+        self.permission_gate = PermissionGate(
+            self.permission_mode,
+            prompt=self._ask_tool_permission,
+        )
+        self.messages = list(cast(list[Message], state.get("messages", self.messages)))
+        self._statusline_enabled = bool(
+            state.get("statusline_enabled", self._statusline_enabled)
+        )
+        raw_context_tokens = state.get("last_context_tokens", self._last_context_tokens)
+        self._last_context_tokens = (
+            int(cast(Any, raw_context_tokens)) if raw_context_tokens is not None else None
+        )
+        self._total_input_tokens = int(
+            cast(Any, state.get("total_input_tokens", self._total_input_tokens))
+        )
+        self._total_cached_tokens = int(
+            cast(Any, state.get("total_cached_tokens", self._total_cached_tokens))
+        )
+        self._total_output_tokens = int(
+            cast(Any, state.get("total_output_tokens", self._total_output_tokens))
+        )
+
+    def _run_turn(self) -> None:
+        for _ in range(self.max_iterations):
+            request = CompletionRequest(
+                model=self.current_model,
+                messages=list(self.messages),
+                max_tokens=self.max_tokens,
+                system=self.system,
+                tools=self.tool_specs,
+            )
+            response = self._drive_stream(request)
+            self._record_usage(response)
+
+            has_tool_uses = any(isinstance(block, ToolUseBlock) for block in response.content)
+            if has_tool_uses:
+                self._write_separator()
+            tool_results = (
+                self._dispatch_tools(response)
+                if response.stop_reason == "tool_use"
+                else []
+            )
+            step = build_turn_step(response, tool_results=tool_results)
+            append_turn_step(self.messages, step)
+            self._persist_session()
+            if not step.continue_running:
+                self._write_status_snapshot()
+                return
+            if tool_results:
+                self._write_separator()
+
+        self._write_line(f"[hit max_iterations={self.max_iterations}; returning control]")
+        self._write_status_snapshot()
+
+    def _drive_stream(self, request: CompletionRequest) -> CompletionResponse:
+        final_response: CompletionResponse | None = None
+        seen_tools: set[str] = set()
+        in_thinking = False
+        in_text = False
+        wrote_content = False
+
+        for event in self.provider.stream(request):
+            if isinstance(event, TextDelta):
+                if in_thinking:
+                    self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
+                    in_thinking = False
+                self._write_styled(event.text, ASSISTANT_STYLE)
+                in_text = True
+                wrote_content = True
+            elif isinstance(event, ThinkingDelta):
+                if not in_thinking:
+                    if in_text:
+                        self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
+                        in_text = False
+                    if self._styles_enabled():
+                        self._write(f"{THINKING_STYLE} thinking {RESET}\n")
+                    else:
+                        self._write("thinking\n")
+                    in_thinking = True
+                    wrote_content = True
+                self._write_styled(event.thinking, THINKING_STYLE)
+            elif isinstance(event, ToolUseDelta):
+                if event.id not in seen_tools and event.name is not None:
+                    seen_tools.add(event.id)
+                    if in_thinking or in_text:
+                        self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
+                        in_thinking = False
+                        in_text = False
+            elif isinstance(event, StreamComplete):
+                final_response = event.response
+
+        if wrote_content:
+            self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
+        if final_response is None:
+            raise RuntimeError("provider.stream() ended without StreamComplete")
+        return final_response
+
+    def _dispatch_tools(self, response: CompletionResponse) -> list[ToolResultBlock]:
+        results: list[ToolResultBlock] = []
+        for block in response.content:
+            if not isinstance(block, ToolUseBlock):
+                continue
+            result = dispatch_tool(block, TOOLS_BY_NAME, self.permission_gate)
+            self._write_tool_result(block, result)
+            results.append(result)
+        return results
+
+    def _ask_tool_permission(self, block: ToolUseBlock) -> PermissionAnswer:
+        summary = tool_permission_summary(block)
+        prompt = f"Allow {summary}? y allow, n deny, a allow all"
+        self._write_panel("permission", prompt, STATUS_STYLE)
+        while True:
+            answer = self._read_permission_answer()
+            if answer in {"y", "Y"}:
+                return PermissionAnswer.ALLOW
+            if answer in {"a", "A"}:
+                return PermissionAnswer.ALLOW_ALL
+            if answer in {"n", "N", "\x1b", ""}:
+                return PermissionAnswer.DENY
+            self._write_panel("permission", "Press y, n, or a.", STATUS_STYLE)
+
+    def _read_permission_answer(self) -> str:
+        if self._force_plain:
+            return self.input_func("").strip()[:1]
+        try:
+            return os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
+        except (AttributeError, OSError):
+            return ""
+
+    def _write_tool_result(
+        self,
+        block: ToolUseBlock,
+        result: ToolResultBlock,
+    ) -> None:
+        self._last_transcript_was_separator = False
+        if block.name in {"write", "edit"} and not result.is_error:
+            self._write_edit_result(block, result)
+            return
+        title = _tool_action_title(block, is_error=result.is_error)
+        preview = _compact_lines(result.content, max_lines=4, max_width=110)
+        if not preview:
+            preview = ["[no output]"]
+        if not self._styles_enabled():
+            self._write_line(f"● {title}")
+            for line in preview:
+                self._write_line(f"  {line}")
+            return
+
+        dot_style = ERROR_TEXT_STYLE if result.is_error else TOOL_DOT_STYLE
+        title_style = ERROR_TEXT_STYLE if result.is_error else TOOL_TITLE_STYLE
+        self._write(f"{dot_style}●{RESET} {title_style}{title}{RESET}\n")
+        for line in preview:
+            self._write(f"{TOOL_PREVIEW_STYLE}  {line}{RESET}\n")
+
+    def _write_edit_result(
+        self,
+        block: ToolUseBlock,
+        result: ToolResultBlock,
+    ) -> None:
+        path = _tool_arg(block, "path", "<missing path>")
+        lines = result.content.splitlines()
+        diff_lines = lines[1:] if lines else []
+        added, deleted = _diff_counts(diff_lines)
+        title = _tool_edit_title(block, path=path, added=added, deleted=deleted)
+        rows = _diff_preview_lines(diff_lines)
+        if not rows:
+            rows = [("meta", lines[0] if lines else "[no changes]")]
+
+        if not self._styles_enabled():
+            self._write_line(f"● {title}")
+            for _, line in rows:
+                self._write_line(line)
+            return
+
+        self._write(f"{TOOL_DOT_STYLE}●{RESET} {TOOL_TITLE_STYLE}{title}{RESET}\n")
+        width = self._terminal_width()
+        for kind, line in rows:
+            if kind == "add":
+                style = DIFF_ADD_STYLE
+            elif kind == "delete":
+                style = DIFF_DELETE_STYLE
+            else:
+                style = DIFF_META_STYLE
+            clipped = line if len(line) <= width else line[: width - 3] + "..."
+            if kind in {"add", "delete"}:
+                self._write(f"{style}{clipped.ljust(width)}{RESET}\n")
+            else:
+                self._write(f"{style}{clipped}{RESET}\n")
+
+    def _write_separator(self) -> None:
+        if self._last_transcript_was_separator:
+            return
+        if not self._styles_enabled():
+            self._write_line("---")
+            self._last_transcript_was_separator = True
+            return
+        self._write(f"{SEPARATOR_STYLE}{'─' * self._terminal_width()}{RESET}\n")
+        self._last_transcript_was_separator = True
+
+    def _handle_slash(self, text: str) -> bool:
+        cmd, _, rest = text.partition(" ")
+        rest = rest.strip()
+        if cmd in ("/exit", "/quit"):
+            return True
+        if cmd == "/clear":
+            self.messages = []
+            self._last_context_tokens = None
+            self._total_input_tokens = 0
+            self._total_cached_tokens = 0
+            self._total_output_tokens = 0
+            self._write_panel("system", "Conversation cleared.", STATUS_STYLE)
+            self._persist_session()
+            return False
+        if cmd == "/help":
+            self._print_help()
+            return False
+        if cmd in ("/session", "/status"):
+            self._write_session_status()
+            return False
+        if cmd == "/statusline":
+            if rest == "off":
+                self._statusline_enabled = False
+                self._write_panel("system", "Status snapshots disabled.", STATUS_STYLE)
+            else:
+                self._statusline_enabled = True
+                self._write_status_snapshot(force=True)
+            return False
+        if cmd == "/model":
+            self._handle_model(rest)
+            return False
+        self._write_panel("error", f"Unknown command: {cmd}", ERROR_STYLE)
+        return False
+
+    def _expand_skill_text(self, text: str) -> str | None:
+        command = text.strip().split(maxsplit=1)[0]
+        if command in BUILTIN_SLASH_COMMANDS:
+            return None
+        return expand_skill_invocation(text, Path.cwd())
+
+    def _handle_model(self, rest: str) -> None:
+        choices = available_model_choices()
+        if not rest:
+            self._write(render_model_choices(choices, current_model=self.current_model))
+            self._write_line("")
+            return
+
+        choice = find_model_choice(rest, choices)
+        if choice is None:
+            self.current_model = rest
+            self._write_panel("model", f"Model set to {self.current_model!r}.", STATUS_STYLE)
+            self._persist_session()
+            return
+        self._apply_model_choice(choice)
+
+    def _apply_model_choice(self, choice: ModelChoice) -> None:
+        self.current_model = choice.model
+        if choice.provider != self.current_provider_name:
+            from willow.cli import _build_provider
+
+            self.provider = _build_provider(choice.provider)
+            self.current_provider_name = choice.provider
+        self._write_panel(
+            "model",
+            f"Model set to {self.current_model!r} "
+            f"using provider {self.current_provider_name!r}.",
+            STATUS_STYLE,
+        )
+        self._persist_session()
+
+    def _print_help(self) -> None:
+        self._write_line("Commands:")
+        self._write_line("  /exit, /quit       Exit Willow.")
+        self._write_line("  /clear             Reset conversation history.")
+        self._write_line("  /help              Show this message.")
+        self._write_line("  /model [name|#]    List or switch models.")
+        self._write_line("  /session, /status  Show persistence and session status.")
+        self._write_line("  /statusline [on|off] Toggle status snapshots.")
+        self._write_line("")
+        self._write_line("Settings:")
+        self._write_line(f"  provider:      {self.current_provider_name}")
+        self._write_line(f"  model:         {self.current_model}")
+        self._write_line(f"  max_tokens:    {self.max_tokens}")
+        self._write_line(f"  mode:          {self.permission_mode.value}")
+        self._write_line(f"  message count: {len(self.messages)}")
+        self._write_line(f"  persistence:   {self._session_persistence_text()}")
+        self._write_line(f"  session:       {self._session_path_text()}")
+
+    def _write_session_status(self) -> None:
+        lines = [
+            f"persistence: {self._session_persistence_text()}",
+            f"session: {self._session_path_text()}",
+            f"mode: {self.permission_mode.value}",
+            f"messages: {len(self.messages)}",
+            f"statusline: {'on' if self._statusline_enabled else 'off'}",
+            self._status_text(),
+        ]
+        self._write_panel("status", "\n".join(lines), STATUS_STYLE)
+
+    def _session_persistence_text(self) -> str:
+        return "enabled" if self._session_record is not None else "disabled"
+
+    def _session_path_text(self) -> str:
+        return str(self._session_path) if self._session_path is not None else "(not saved)"
+
+    def _record_usage(self, response: CompletionResponse) -> None:
+        input_tokens = response.usage.get("input_tokens", 0)
+        output_tokens = response.usage.get("output_tokens", 0)
+        cached_tokens = _cached_tokens_from_usage(response.usage)
+        self._total_input_tokens += input_tokens
+        self._total_cached_tokens += cached_tokens
+        self._total_output_tokens += output_tokens
+        self._last_context_tokens = input_tokens if input_tokens > 0 else None
+
+    def _status_text(self) -> str:
+        return _render_statusline(
+            model=self.current_model,
+            context_tokens=self._last_context_tokens,
+            context_window=_context_window_for_model(self.current_model),
+            input_tokens=self._total_input_tokens,
+            cached_tokens=self._total_cached_tokens,
+            output_tokens=self._total_output_tokens,
+            cwd=_display_cwd(),
+        )
+
+    def _write_status_snapshot(self, *, force: bool = False) -> None:
+        if self._can_run_live():
+            return
+        if self._statusline_enabled or force:
+            self._write_panel("status", self._status_text(), STATUS_STYLE)
+
+    def _write_resume_history_if_pending(self) -> None:
+        if not self._resume_history_pending:
+            return
+        self._resume_history_pending = False
+        self._write_panel(
+            "resumed",
+            f"Loaded {len(self.messages)} saved message(s) from {self._session_path_text()}.",
+            STATUS_STYLE,
+        )
+        self._write_history_transcript()
+
+    def _continue_resumed_turn_if_needed(self) -> None:
+        if _history_ends_with_tool_results(self.messages):
+            self._write_panel(
+                "resumed",
+                "Continuing from saved tool result.",
+                STATUS_STYLE,
+            )
+            self._run_turn()
+
+    def _write_history_transcript(self) -> None:
+        for index, message in enumerate(self.messages):
+            if index:
+                self._write_separator()
+            self._write_history_message(message)
+        if self.messages:
+            self._write_separator()
+
+    def _write_history_message(self, message: Message) -> None:
+        text_parts: list[str] = []
+        tool_results: list[ToolResultBlock] = []
+        tool_uses: list[ToolUseBlock] = []
+        thinking_parts: list[str] = []
+        redacted_thinking = 0
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                text_parts.append(block.text)
+            elif isinstance(block, ThinkingBlock):
+                thinking_parts.append(block.thinking)
+            elif isinstance(block, ToolUseBlock):
+                tool_uses.append(block)
+            elif isinstance(block, ToolResultBlock):
+                tool_results.append(block)
+            else:
+                redacted_thinking += 1
+
+        if thinking_parts:
+            self._write_panel("thinking", "\n".join(thinking_parts), THINKING_STYLE)
+        elif redacted_thinking:
+            self._write_panel(
+                "thinking",
+                f"[{redacted_thinking} redacted thinking block(s)]",
+                THINKING_STYLE,
+            )
+
+        text = "\n".join(part for part in text_parts if part)
+        if text:
+            self._write_block(text, USER_STYLE if message.role == "user" else ASSISTANT_STYLE)
+        elif not tool_uses and not tool_results and not thinking_parts and not redacted_thinking:
+            self._write_panel(message.role, "[empty message]", STATUS_STYLE)
+
+        for block in tool_uses:
+            self._write_panel("tool use", tool_permission_summary(block), TOOL_TITLE_STYLE)
+        for block in tool_results:
+            label = "tool error" if block.is_error else "tool result"
+            preview = "\n".join(_compact_lines(block.content, max_lines=6, max_width=110))
+            style = ERROR_STYLE if block.is_error else TOOL_PREVIEW_STYLE
+            self._write_panel(label, preview or "[no output]", style)
+
+    def _write_welcome_card(self) -> None:
+        rows = [
+            ("model:", self.current_model),
+            ("directory:", _display_cwd()),
+        ]
+        content_width = max(
+            len(WELCOME_TITLE),
+            *(len(line) for line in WILLOW_LOGO_LINES),
+            *(len(label) + 2 + len(value) for label, value in rows),
+        )
+        width = min(self._terminal_width() - 2, max(36, content_width + 4))
+        inner_width = width - 2
+
+        if not self._styles_enabled():
+            self._write_line(f"┌{'─' * inner_width}┐")
+            for line in WILLOW_LOGO_LINES:
+                self._write_line(f"│ {line.center(inner_width - 1)}│")
+            self._write_line(f"│ {WELCOME_TITLE.ljust(inner_width - 1)}│")
+            self._write_line(f"│ {' '.ljust(inner_width - 1)}│")
+            for label, value in rows:
+                self._write_line(f"│ {label:<10} {value.ljust(inner_width - 12)}│")
+            self._write_line(f"└{'─' * inner_width}┘")
+            return
+
+        self._write(f"{WELCOME_BORDER_STYLE}┌{'─' * inner_width}┐{RESET}\n")
+        for line in WILLOW_LOGO_LINES:
+            self._write(
+                f"{WELCOME_BORDER_STYLE}│{RESET} "
+                f"{WELCOME_LOGO_STYLE}{line.center(inner_width - 1)}{RESET}"
+                f"{WELCOME_BORDER_STYLE}│{RESET}\n"
+            )
+        title = WELCOME_TITLE
+        title_padding = inner_width - 1 - len(title)
+        self._write(
+            f"{WELCOME_BORDER_STYLE}│{RESET} "
+            f"{WELCOME_TITLE_STYLE}{title}{RESET}"
+            f"{' ' * max(0, title_padding)}"
+            f"{WELCOME_BORDER_STYLE}│{RESET}\n"
+        )
+        self._write(
+            f"{WELCOME_BORDER_STYLE}│{RESET}{' ' * inner_width}"
+            f"{WELCOME_BORDER_STYLE}│{RESET}\n"
+        )
+        for label, value in rows:
+            body_width = inner_width - 1
+            label_text = f"{label:<10}"
+            value_width = max(0, body_width - len(label_text) - 1)
+            if len(value) <= value_width:
+                visible_value = value
+            elif value_width <= 3:
+                visible_value = value[-value_width:] if value_width else ""
+            else:
+                visible_value = "..." + value[-(value_width - 3) :]
+            self._write(
+                f"{WELCOME_BORDER_STYLE}│{RESET} "
+                f"{WELCOME_LABEL_STYLE}{label_text}{RESET} "
+                f"{WELCOME_VALUE_STYLE}{visible_value.ljust(value_width)}{RESET}"
+                f"{WELCOME_BORDER_STYLE}│{RESET}\n"
+            )
+        self._write(f"{WELCOME_BORDER_STYLE}└{'─' * inner_width}┘{RESET}\n")
+
+    def _prompt(self) -> str:
+        if not self._statusline_enabled:
+            return "> "
+        return f"willow [{self._status_text()}] > "
+
+    def _persist_session(self) -> None:
+        if self._session_record is None:
+            return
+        self._session_record = replace(
+            self._session_record,
+            settings=SessionSettings(
+                provider=self.current_provider_name,
+                model=self.current_model,
+                system=self.system,
+                max_tokens=self.max_tokens,
+                max_iterations=self.max_iterations,
+            ),
+            messages=list(self.messages),
+        )
+        self._session_path = save_session(self._session_record, self._session_path)
+
+    def _write(self, text: str) -> None:
+        self.out.write(text)
+        self.out.flush()
+
+    def _write_line(self, text: str) -> None:
+        self._write(f"{text}\n")
+
+    def _styles_enabled(self) -> bool:
+        return (
+            not self._force_plain
+            and hasattr(self.out, "isatty")
+            and self.out.isatty()
+        )
+
+    def _terminal_width(self) -> int:
+        return max(40, shutil.get_terminal_size((88, 24)).columns)
+
+    def _write_styled(self, text: str, style: str) -> None:
+        self._last_transcript_was_separator = False
+        if self._styles_enabled():
+            self._write(f"{style}{text}{RESET}")
+        else:
+            self._write(text)
+
+    def _write_panel(self, label: str, text: str, style: str) -> None:
+        self._last_transcript_was_separator = False
+        if not self._styles_enabled():
+            self._write_line(f"[{label}] {text}")
+            return
+
+        width = self._terminal_width()
+        header = f" {label} "
+        self._write(f"{style}{header.ljust(width)}{RESET}\n")
+        for line in (text.splitlines() or [""]):
+            body = f" {line}"
+            for wrapped in _wrap_terminal_line(body, width):
+                content = wrapped.ljust(width)
+                if label == "status":
+                    content = _style_statusline_text(content)
+                self._write(f"{style}{content}{RESET}\n")
+
+    def _write_block(self, text: str, style: str) -> None:
+        self._last_transcript_was_separator = False
+        if not self._styles_enabled():
+            self._write_line(text)
+            return
+
+        width = self._terminal_width()
+        for line in (text.splitlines() or [""]):
+            body = f" {line}"
+            for wrapped in _wrap_terminal_line(body, width):
+                self._write(f"{style}{wrapped.ljust(width)}{RESET}\n")
+
+
+class _LiveTerminal:
+    """Raw-mode prompt that stays active while provider streaming runs."""
+
+    def __init__(self, app: WillowApp) -> None:
+        self.app = app
+        try:
+            self.fd = sys.stdin.fileno()
+        except (AttributeError, OSError):
+            self.fd = -1
+        self.events: queue.Queue[tuple[int, str, Any]] = queue.Queue()
+        self.buffer = ""
+        self.cursor = 0
+        self.running = True
+        self.streaming = False
+        self.worker: threading.Thread | None = None
+        self.pending_user_inputs: list[str] = []
+        self.prompt_lines = 0
+        self.prompt_cursor_offset_from_bottom = 0
+        self.in_text = False
+        self.in_thinking = False
+        self.seen_tools: set[str] = set()
+        self.stream_text: list[str] = []
+        self.stream_thinking: list[str] = []
+        self.stream_tool_names: list[str] = []
+        self.active_turn_id = 0
+        self.model_picker_choices: list[ModelChoice] | None = None
+        self.model_picker_selected = 0
+        self.input_hint_rows: list[str] | None = None
+        self.input_hint_source = ""
+        self.input_hint_selected = 0
+
+    def run(self) -> int:
+        self.app._write_welcome_card()
+        self.app._write_resume_history_if_pending()
+        with self._raw_terminal():
+            if _history_ends_with_tool_results(self.app.messages):
+                self.app._write_panel(
+                    "resumed",
+                    "Continuing from saved tool result.",
+                    STATUS_STYLE,
+                )
+                self._start_worker()
+            self._draw_prompt()
+            try:
+                while self.running:
+                    self._read_available_input()
+                    self._drain_events()
+                if not self.streaming and self.worker is None and self.pending_user_inputs:
+                    self._start_queued_turn()
+            except KeyboardInterrupt:
+                self.running = False
+        self._clear_prompt()
+        self.app._write_line("Goodbye.")
+        return 0
+
+    @contextmanager
+    def _raw_terminal(self):
+        old = termios.tcgetattr(self.fd)
+        try:
+            tty.setcbreak(self.fd)
+            self.app._write("\x1b[?2004h")
+            yield
+        finally:
+            self.app._write("\x1b[?2004l\x1b[0m\x1b[?25h")
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
+
+    def _read_available_input(self) -> None:
+        readable, _, _ = select.select([self.fd], [], [], 0.03)
+        if not readable:
+            return
+        data = os.read(self.fd, 4096).decode(errors="ignore")
+        index = 0
+        while index < len(data):
+            if data.startswith("\x1b[200~", index):
+                end = data.find("\x1b[201~", index + 6)
+                if end == -1:
+                    pasted = data[index + 6 :]
+                    index = len(data)
+                else:
+                    pasted = data[index + 6 : end]
+                    index = end + 6
+                self._insert_text(pasted)
+                self._draw_prompt()
+                continue
+            ch = data[index]
+            index += 1
+            if ch in ("\r", "\n"):
+                self._submit_buffer()
+            elif ch == "\t":
+                if not self._complete_selected_hint():
+                    self._insert_text(ch)
+                self._draw_prompt()
+            elif ch == "\x03" or (ch == "\x04" and not self.buffer):
+                self.running = False
+            elif ch == "\x15":
+                self.buffer = ""
+                self.cursor = 0
+                self._draw_prompt()
+            elif ch in ("\x7f", "\b"):
+                if self.cursor > 0:
+                    self.buffer = self.buffer[: self.cursor - 1] + self.buffer[self.cursor :]
+                    self.cursor -= 1
+                self._draw_prompt()
+            elif ch == "\x1b":
+                if data.startswith("b", index) or data.startswith("B", index):
+                    self._move_cursor_word_left()
+                    index += 1
+                    self._draw_prompt()
+                elif data.startswith("f", index) or data.startswith("F", index):
+                    self._move_cursor_word_right()
+                    index += 1
+                    self._draw_prompt()
+                elif data.startswith("[1;3D", index) or data.startswith("[1;5D", index):
+                    self._move_cursor_word_left()
+                    index += 5
+                    self._draw_prompt()
+                elif data.startswith("[1;3C", index) or data.startswith("[1;5C", index):
+                    self._move_cursor_word_right()
+                    index += 5
+                    self._draw_prompt()
+                elif data.startswith("[A", index) or data.startswith("OA", index):
+                    self._move_picker_selection(-1)
+                    index += 2
+                    self._draw_prompt()
+                elif data.startswith("[B", index) or data.startswith("OB", index):
+                    self._move_picker_selection(1)
+                    index += 2
+                    self._draw_prompt()
+                elif data.startswith("[D", index):
+                    self.cursor = max(0, self.cursor - 1)
+                    index += 2
+                    self._draw_prompt()
+                elif data.startswith("[C", index):
+                    self.cursor = min(len(self.buffer), self.cursor + 1)
+                    index += 2
+                    self._draw_prompt()
+                elif data.startswith("[H", index) or data.startswith("[1~", index):
+                    self.cursor = 0
+                    index += 2 if data.startswith("[H", index) else 3
+                    self._draw_prompt()
+                elif data.startswith("[F", index) or data.startswith("[4~", index):
+                    self.cursor = len(self.buffer)
+                    index += 2 if data.startswith("[F", index) else 3
+                    self._draw_prompt()
+                elif self.streaming and (index >= len(data) or data[index] != "["):
+                    self._interrupt_with_buffer_if_possible()
+                else:
+                    # Ignore unsupported escape sequences; this keeps arrow keys harmless.
+                    while index < len(data) and data[index].isalpha() is False:
+                        index += 1
+                    if index < len(data):
+                        index += 1
+            elif ch.isprintable():
+                self._insert_text(ch)
+                self._draw_prompt()
+
+    def _insert_text(self, text: str) -> None:
+        self.buffer = self.buffer[: self.cursor] + text + self.buffer[self.cursor :]
+        self.cursor += len(text)
+
+    def _move_cursor_word_left(self) -> None:
+        cursor = self.cursor
+        while cursor > 0 and self.buffer[cursor - 1].isspace():
+            cursor -= 1
+        while cursor > 0 and not self.buffer[cursor - 1].isspace():
+            cursor -= 1
+        self.cursor = cursor
+
+    def _move_cursor_word_right(self) -> None:
+        cursor = self.cursor
+        length = len(self.buffer)
+        while cursor < length and self.buffer[cursor].isspace():
+            cursor += 1
+        while cursor < length and not self.buffer[cursor].isspace():
+            cursor += 1
+        self.cursor = cursor
+
+    def _model_picker_active(self) -> bool:
+        return not self.streaming and self.buffer.strip() == "/model"
+
+    def _ensure_model_picker(self) -> list[ModelChoice] | None:
+        if not self._model_picker_active():
+            self.model_picker_choices = None
+            self.model_picker_selected = 0
+            return None
+        if self.model_picker_choices is None:
+            choices = available_model_choices()
+            self.model_picker_choices = choices
+            current_index = next(
+                (
+                    index
+                    for index, choice in enumerate(choices)
+                    if choice.model == self.app.current_model
+                ),
+                0,
+            )
+            self.model_picker_selected = min(current_index, max(0, len(choices) - 1))
+        return self.model_picker_choices
+
+    def _move_model_picker_selection(self, delta: int) -> None:
+        choices = self._ensure_model_picker()
+        if not choices:
+            return
+        self.model_picker_selected = max(
+            0,
+            min(len(choices) - 1, self.model_picker_selected + delta),
+        )
+
+    def _input_hints_active(self) -> bool:
+        return not self.streaming and not self._model_picker_active()
+
+    def _ensure_input_hints(self) -> list[str]:
+        if not self._input_hints_active():
+            self.input_hint_rows = None
+            self.input_hint_source = ""
+            self.input_hint_selected = 0
+            return []
+        hints = _render_input_hints(self.buffer, Path.cwd())
+        rows = hints.splitlines() if hints else []
+        source = "\n".join(rows)
+        if source != self.input_hint_source:
+            self.input_hint_source = source
+            self.input_hint_rows = rows
+            self.input_hint_selected = 0
+        if rows:
+            self.input_hint_selected = min(self.input_hint_selected, len(rows) - 1)
+        else:
+            self.input_hint_selected = 0
+        return rows
+
+    def _move_input_hint_selection(self, delta: int) -> None:
+        rows = self._ensure_input_hints()
+        if not rows:
+            return
+        self.input_hint_selected = max(
+            0,
+            min(len(rows) - 1, self.input_hint_selected + delta),
+        )
+
+    def _move_picker_selection(self, delta: int) -> None:
+        if self._model_picker_active():
+            self._move_model_picker_selection(delta)
+        else:
+            self._move_input_hint_selection(delta)
+
+    def _complete_selected_hint(self) -> bool:
+        if self._model_picker_active():
+            choices = self._ensure_model_picker()
+            if not choices:
+                return False
+            selected = choices[self.model_picker_selected]
+            self.buffer = f"/model {selected.model}"
+            self.cursor = len(self.buffer)
+            self.model_picker_choices = None
+            self.model_picker_selected = 0
+            return True
+
+        rows = self._ensure_input_hints()
+        if not rows:
+            return False
+        selected = rows[self.input_hint_selected]
+        self.buffer = _apply_hint_to_input(
+            self.buffer,
+            selected,
+            append_space_when_empty=True,
+        )
+        self.cursor = len(self.buffer)
+        self.input_hint_rows = None
+        self.input_hint_source = ""
+        self.input_hint_selected = 0
+        return True
+
+    def _submit_buffer(self, *, use_selected_hint: bool = True) -> None:
+        if self._model_picker_active():
+            self._submit_model_picker_selection()
+            return
+        if use_selected_hint and self._submit_input_hint_selection():
+            return
+        text = self.buffer.strip()
+        self.buffer = ""
+        self.cursor = 0
+        self._clear_prompt()
+        if not text:
+            self._draw_prompt()
+            return
+        if self.streaming:
+            self.pending_user_inputs.append(text)
+            if text.startswith("/"):
+                message = (
+                    "Queued command text while a turn is streaming; "
+                    "press Esc to interrupt and send now."
+                )
+            else:
+                message = (
+                    "Queued input while a turn is streaming; "
+                    "press Esc to interrupt and send now."
+                )
+            self.app._write_panel("status", message, STATUS_STYLE)
+            self._draw_prompt()
+            return
+        expanded_text = self.app._expand_skill_text(text)
+        if expanded_text is None and text.startswith("/") and not self.streaming:
+            should_exit = self.app._handle_slash(text)
+            if should_exit:
+                self.running = False
+                return
+            self._draw_prompt()
+            return
+
+        self.app._write_block(text, USER_STYLE)
+        self.app.messages.append(
+            Message(role="user", content=[TextBlock(text=expanded_text or text)])
+        )
+        self.app._persist_session()
+        self._start_worker()
+        self._draw_prompt()
+
+    def _submit_input_hint_selection(self) -> bool:
+        rows = self._ensure_input_hints()
+        if not rows:
+            return False
+        selected = rows[self.input_hint_selected]
+        text = _apply_hint_to_input(self.buffer, selected)
+        if text.strip() == "/model":
+            self.buffer = "/model"
+            self.cursor = len(self.buffer)
+            self.input_hint_rows = None
+            self.input_hint_source = ""
+            self.input_hint_selected = 0
+            self._draw_prompt()
+            return True
+        self.buffer = text
+        self.cursor = len(self.buffer)
+        self.input_hint_rows = None
+        self.input_hint_source = ""
+        self.input_hint_selected = 0
+        self._submit_buffer(use_selected_hint=False)
+        return True
+
+    def _submit_model_picker_selection(self) -> None:
+        choices = self._ensure_model_picker()
+        selected_index = self.model_picker_selected
+        self.buffer = ""
+        self.cursor = 0
+        self.model_picker_choices = None
+        self.model_picker_selected = 0
+        self._clear_prompt()
+        if not choices:
+            self.app._write_panel(
+                "model",
+                "No models available. Add openai or anthropic auth to ~/.willow/auth.json.",
+                ERROR_STYLE,
+            )
+            self._draw_prompt()
+            return
+        selected = choices[selected_index]
+        self.app._apply_model_choice(selected)
+        self._draw_prompt()
+
+    def _interrupt_with_buffer_if_possible(self) -> None:
+        text = self.buffer.strip()
+        if text:
+            self.buffer = ""
+            self.cursor = 0
+            self.pending_user_inputs.append(text)
+        if self.pending_user_inputs:
+            self._interrupt_and_send_queued()
+        else:
+            self._draw_prompt()
+
+    def _start_queued_turn(self) -> None:
+        self._append_pending_user_message(render=True)
+        self._start_worker()
+        self._draw_prompt()
+
+    def _append_pending_user_message(self, *, render: bool) -> None:
+        pending = self.pending_user_inputs
+        self.pending_user_inputs = []
+        if render:
+            for text in pending:
+                self.app._write_block(text, USER_STYLE)
+        blocks = queued_user_text_blocks(pending)
+        self.app.messages.append(Message(role="user", content=list(blocks)))
+        self.app._persist_session()
+
+    def _interrupt_and_send_queued(self) -> None:
+        if not self.streaming or not self.pending_user_inputs:
+            return
+        self.active_turn_id += 1
+        self._clear_stream_buffers()
+        self._clear_prompt()
+        self.app._write_panel(
+            "status",
+            "Interrupted current turn; sending queued input now.",
+            STATUS_STYLE,
+        )
+        self._append_interrupted_user_message(render=True)
+        self._reset_provider_for_interrupt()
+        self._start_worker()
+        self._draw_prompt()
+
+    def _append_interrupted_user_message(self, *, render: bool) -> None:
+        pending = self.pending_user_inputs
+        self.pending_user_inputs = []
+        interrupted = self._take_trailing_text_user_message()
+        if render:
+            for text in pending:
+                self.app._write_block(text, USER_STYLE)
+        blocks = (
+            interrupted_user_text_blocks(interrupted, pending)
+            if interrupted
+            else queued_user_text_blocks(pending)
+        )
+        self.app.messages.append(Message(role="user", content=list(blocks)))
+        self.app._persist_session()
+
+    def _take_trailing_text_user_message(self) -> list[str]:
+        if not self.app.messages or self.app.messages[-1].role != "user":
+            return []
+        message = self.app.messages[-1]
+        if not all(isinstance(block, TextBlock) for block in message.content):
+            return []
+        self.app.messages.pop()
+        return [cast(TextBlock, block).text for block in message.content]
+
+    def _reset_provider_for_interrupt(self) -> None:
+        from willow.cli import _build_provider
+
+        self.app.provider = _build_provider(self.app.current_provider_name)
+
+    def _start_worker(self) -> None:
+        self.streaming = True
+        self.active_turn_id += 1
+        self.in_text = False
+        self.in_thinking = False
+        self.seen_tools = set()
+        self._clear_stream_buffers()
+        turn_id = self.active_turn_id
+        provider = self.app.provider
+        self.worker = threading.Thread(
+            target=self._worker_main,
+            args=(turn_id, provider),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _worker_main(self, turn_id: int, provider: Provider) -> None:
+        try:
+            request = CompletionRequest(
+                model=self.app.current_model,
+                messages=list(self.app.messages),
+                max_tokens=self.app.max_tokens,
+                system=self.app.system,
+                tools=self.app.tool_specs,
+            )
+            final: CompletionResponse | None = None
+            for event in provider.stream(request):
+                self.events.put((turn_id, "stream", event))
+                if isinstance(event, StreamComplete):
+                    final = event.response
+            if final is None:
+                raise RuntimeError("provider.stream() ended without StreamComplete")
+            self.events.put((turn_id, "complete", final))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put((turn_id, "error", exc))
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                turn_id, kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if turn_id != self.active_turn_id:
+                continue
+            if kind == "stream":
+                self._render_stream_event(payload)
+            elif kind == "complete":
+                self._clear_prompt()
+                self._finish_response(cast(CompletionResponse, payload))
+            elif kind == "error":
+                self._clear_prompt()
+                self.app._write_panel("error", repr(payload), ERROR_STYLE)
+                self.streaming = False
+            if self.running and kind != "stream":
+                self._draw_prompt()
+
+    def _render_stream_event(self, event: Any) -> None:
+        if isinstance(event, TextDelta):
+            self.stream_text.append(event.text)
+        elif isinstance(event, ThinkingDelta):
+            self.stream_thinking.append(event.thinking)
+        elif (
+            isinstance(event, ToolUseDelta)
+            and event.id not in self.seen_tools
+            and event.name is not None
+        ):
+            self.seen_tools.add(event.id)
+            self.stream_tool_names.append(event.name)
+
+    def _finish_response(self, response: CompletionResponse) -> None:
+        self._flush_stream_buffer()
+        self.in_text = False
+        self.in_thinking = False
+        self.app._record_usage(response)
+        has_tool_uses = any(isinstance(block, ToolUseBlock) for block in response.content)
+        if has_tool_uses:
+            self.app._write_separator()
+        tool_results = (
+            self.app._dispatch_tools(response)
+            if response.stop_reason == "tool_use"
+            else []
+        )
+        pending_texts = self.pending_user_inputs
+        for text in pending_texts:
+            self.app._write_block(text, USER_STYLE)
+        pending = queued_user_text_blocks(pending_texts)
+        self.pending_user_inputs = []
+        step = build_turn_step(
+            response,
+            tool_results=tool_results,
+            pending_user_blocks=pending,
+        )
+        append_turn_step(self.app.messages, step)
+        self.app._persist_session()
+        if step.continue_running:
+            if tool_results:
+                self.app._write_separator()
+            self._start_worker()
+        else:
+            self.streaming = False
+            self.app._write_status_snapshot()
+
+    def _flush_stream_buffer(self) -> None:
+        thinking = "".join(self.stream_thinking)
+        text = "".join(self.stream_text)
+        if thinking:
+            self.app._write_block(thinking, THINKING_STYLE)
+        if text:
+            self.app._write_block(text, ASSISTANT_STYLE)
+        self._clear_stream_buffers()
+
+    def _clear_stream_buffers(self) -> None:
+        self.stream_thinking = []
+        self.stream_text = []
+        self.stream_tool_names = []
+
+    def _draw_prompt(self) -> None:
+        self._clear_prompt()
+        width = self.app._terminal_width()
+        status = self.app._status_text()
+        preview = _strip_control(self.buffer)
+        cursor = min(len(preview), len(_strip_control(self.buffer[: self.cursor])))
+        self.app._write("\x1b[?25l")
+        prompt_lines = 0
+        if self.streaming:
+            self.app._write(f"{STATUS_STYLE}{' working...'.ljust(width)}{RESET}\n")
+            prompt_lines += 1
+        if self.pending_user_inputs:
+            title = " Messages to be submitted after next tool call"
+            hint = " (press esc to interrupt and send immediately)"
+            self.app._write(f"{STATUS_STYLE}{title[:width].ljust(width)}{RESET}\n")
+            prompt_lines += 1
+            self.app._write(f"{STATUS_STYLE}{hint[:width].ljust(width)}{RESET}\n")
+            prompt_lines += 1
+            for text in self.pending_user_inputs:
+                line = f"  ↳ {_strip_control(text)}"
+                self.app._write(f"{STATUS_STYLE}{line[:width].ljust(width)}{RESET}\n")
+                prompt_lines += 1
+        prefix = " > "
+        continuation_prefix = " " * len(prefix)
+        first_input_width = max(1, width - len(prefix))
+        continuation_width = max(1, width - len(continuation_prefix))
+        if len(preview) <= first_input_width:
+            input_lines = [preview]
+            line_starts = [0]
+        else:
+            input_lines = [preview[:first_input_width]]
+            line_starts = [0]
+            for index in range(first_input_width, len(preview), continuation_width):
+                input_lines.append(preview[index : index + continuation_width])
+                line_starts.append(index)
+        if not input_lines:
+            input_lines = [""]
+            line_starts = [0]
+        cursor_line = 0
+        for line_index, (line, start) in enumerate(zip(input_lines, line_starts, strict=True)):
+            end = start + len(line)
+            if cursor < end or cursor == end and (
+                cursor == len(preview) or line_index == len(input_lines) - 1
+            ):
+                cursor_line = line_index
+                break
+            cursor_line = min(line_index + 1, len(input_lines) - 1)
+        cursor_column = cursor - line_starts[cursor_line]
+        if cursor_line == 0:
+            cursor_column += len(prefix)
+        else:
+            cursor_column += len(continuation_prefix)
+        prompt_line_index = prompt_lines + cursor_line
+        for line_index, line in enumerate(input_lines):
+            if line_index:
+                self.app._write("\n")
+            display = f"{prefix}{line}" if line_index == 0 else f"{continuation_prefix}{line}"
+            self.app._write(f"{PROMPT_STYLE}{display.ljust(width)}{RESET}")
+            prompt_lines += 1
+        model_picker_choices = self._ensure_model_picker()
+        if model_picker_choices is not None:
+            rows = _render_model_picker_rows(
+                model_picker_choices,
+                current_model=self.app.current_model,
+                selected_index=self.model_picker_selected,
+                width=width,
+                styles_enabled=self.app._styles_enabled(),
+            )
+            for row in rows:
+                self.app._write(f"\n{row}")
+                prompt_lines += 1
+        else:
+            input_hints = self._ensure_input_hints()
+            if input_hints:
+                rows = _render_input_hint_rows(
+                    input_hints,
+                    selected_index=self.input_hint_selected,
+                    width=width,
+                    styles_enabled=self.app._styles_enabled(),
+                )
+                for row in rows:
+                    self.app._write(f"\n{row}")
+                    prompt_lines += 1
+            elif self.app._statusline_enabled:
+                line = f" {status}"[:width].ljust(width)
+                self.app._write(
+                    f"\n{STATUS_STYLE}{_style_statusline_text(line)}{RESET}"
+                )
+                prompt_lines += 1
+        self.prompt_lines = prompt_lines
+        self.prompt_cursor_offset_from_bottom = prompt_lines - prompt_line_index - 1
+        self._place_prompt_cursor(cursor_column)
+
+    def _place_prompt_cursor(self, column: int) -> None:
+        if self.prompt_cursor_offset_from_bottom:
+            self.app._write(f"\x1b[{self.prompt_cursor_offset_from_bottom}A")
+        self.app._write("\r")
+        if column:
+            self.app._write(f"\x1b[{column}C")
+        self.app._write("\x1b[?25h")
+
+    def _clear_prompt(self) -> None:
+        if self.prompt_lines == 0:
+            return
+        if self.prompt_cursor_offset_from_bottom:
+            self.app._write(f"\x1b[{self.prompt_cursor_offset_from_bottom}B")
+            self.prompt_cursor_offset_from_bottom = 0
+        self.app._write("\x1b[?25l\r\x1b[2K")
+        for _ in range(self.prompt_lines - 1):
+            self.app._write("\x1b[1A\r\x1b[2K")
+        self.app._write("\x1b[?25h")
+        self.prompt_lines = 0
+
+
+def _state_from_session(record: SessionRecord) -> dict[str, object]:
+    last_context_tokens = next(
+        (
+            message.input_tokens
+            for message in reversed(record.messages)
+            if message.role == "assistant" and message.input_tokens > 0
+        ),
+        None,
+    )
+    return {
+        "current_provider_name": record.settings.provider,
+        "current_model": record.settings.model,
+        "system": record.settings.system,
+        "max_tokens": record.settings.max_tokens,
+        "max_iterations": record.settings.max_iterations,
+        "messages": list(record.messages),
+        "statusline_enabled": True,
+        "last_context_tokens": last_context_tokens,
+        "total_input_tokens": sum(message.input_tokens for message in record.messages),
+        "total_cached_tokens": sum(message.cached_tokens for message in record.messages),
+        "total_output_tokens": sum(message.output_tokens for message in record.messages),
+    }
+
+
+def _apply_resumed_session(
+    args: argparse.Namespace,
+    record: SessionRecord,
+    path: Path,
+) -> dict[str, object]:
+    args.provider = record.settings.provider
+    args.model = record.settings.model
+    args.max_tokens = record.settings.max_tokens
+    args.max_iterations = record.settings.max_iterations
+    args._resume_session_record = record
+    args._resume_session_path = path
+    return _state_from_session(record)
+
+
+def _load_resume_arg(selector: str) -> tuple[SessionRecord, Path]:
+    path = resolve_session_path(selector)
+    return load_session(path), path
+
+
+def _select_resume_session(entries: list[SessionEntry]) -> SessionEntry | None:
+    if not entries:
+        return None
+    if not (
+        hasattr(sys.stdin, "isatty")
+        and sys.stdin.isatty()
+        and hasattr(sys.stdout, "isatty")
+        and sys.stdout.isatty()
+    ):
+        return entries[0]
+    return _run_resume_picker(entries)
+
+
+def _run_resume_picker(entries: list[SessionEntry]) -> SessionEntry | None:
+    width = max(72, shutil.get_terminal_size((88, 24)).columns)
+    selected = 0
+    rows = min(len(entries), max(1, shutil.get_terminal_size((88, 24)).lines - 6))
+
+    def draw() -> None:
+        offset = min(max(0, selected - rows + 1), max(0, len(entries) - rows))
+        sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
+        sys.stdout.write("Resume Willow Session\n")
+        sys.stdout.write("Enter resumes the highlighted session. Esc starts a new session.\n\n")
+        for visible_idx, entry in enumerate(entries[offset : offset + rows]):
+            idx = offset + visible_idx
+            marker = ">" if idx == selected else " "
+            text = _session_label(entry)
+            if len(text) > width - 4:
+                text = text[: width - 7] + "..."
+            if idx == selected:
+                sys.stdout.write(
+                    f"\x1b[48;5;23;38;5;231m "
+                    f"{marker} {text.ljust(width - 4)} \x1b[0m\n"
+                )
+            else:
+                sys.stdout.write(f" {marker} {text}\n")
+        sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        draw()
+        while True:
+            data = os.read(fd, 8).decode(errors="ignore")
+            if data in ("\r", "\n"):
+                return entries[selected]
+            if data == "\x1b":
+                return None
+            if data in ("\x1b[A", "\x1bOA"):
+                selected = max(0, selected - 1)
+                draw()
+            elif data in ("\x1b[B", "\x1bOB"):
+                selected = min(len(entries) - 1, selected + 1)
+                draw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
+        sys.stdout.flush()
+
+
+def _resolve_resume(args: argparse.Namespace) -> dict[str, object] | None:
+    resume = getattr(args, "resume", None)
+    if resume is None:
+        return None
+    if resume:
+        record, path = _load_resume_arg(str(resume))
+        return _apply_resumed_session(args, record, path)
+
+    selected = _select_resume_session(list_sessions())
+    if selected is None:
+        return None
+    return _apply_resumed_session(args, selected.record, selected.path)
+
+
+def run_tui(args: argparse.Namespace) -> int:
+    """Entry point wired in from `willow.cli`."""
+    from willow.cli import _build_provider
+
+    try:
+        state = _resolve_resume(args)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"Could not resume session: {exc}\n")
+        sys.stderr.flush()
+        return 1
+
+    provider = _build_provider(args.provider)
+    args.persist_session = True
+    app = WillowApp(args, provider, inline_mode=True, state=state)
+    return app.run() or 0

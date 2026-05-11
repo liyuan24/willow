@@ -1,0 +1,38 @@
+[project]
+name = "willow"
+version = "0.1.0"
+description = "Willow — a pure-Python agent framework in the spirit of Claude Code."
+readme = "README.md"
+authors = [
+    { name = "seanliu", email = "liyuanlacfo1990@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=2.35.1",
+]
+
+[project.scripts]
+willow = "willow.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.16,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

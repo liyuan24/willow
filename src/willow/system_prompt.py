@@ -1,0 +1,236 @@
+"""System prompt construction for Willow."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+from willow.permissions import PermissionMode
+from willow.tools.base import Tool
+
+
+@dataclass(frozen=True, slots=True)
+class ContextFile:
+    path: Path
+    content: str
+
+
+DEFAULT_SYSTEM_PROMPT = (
+    "I'm Willow, an AI coding assistant. I help users by reading files, executing "
+    "commands, editing code, and writing new files."
+)
+
+CONTEXT_FILENAMES = ("WILLOW.md",)
+
+
+def _load_first_context_file(directory: Path) -> ContextFile | None:
+    for filename in CONTEXT_FILENAMES:
+        path = directory / filename
+        if not path.is_file():
+            continue
+        try:
+            return ContextFile(path=path, content=path.read_text())
+        except OSError:
+            continue
+    return None
+
+
+def _ancestor_dirs(cwd: Path) -> list[Path]:
+    resolved = cwd.resolve()
+    return [*reversed(resolved.parents), resolved]
+
+
+def load_context_files(
+    *,
+    cwd: Path | None = None,
+    user_dir: Path | None = None,
+) -> list[ContextFile]:
+    """Load Willow context files from user and project locations.
+
+    User context lives in ``~/.willow``. Project context may live directly in an
+    ancestor directory or in that directory's ``.willow`` folder. Willow only
+    loads ``WILLOW.md``; it intentionally does not read other agents' files.
+    """
+
+    resolved_cwd = (cwd or Path.cwd()).resolve()
+    resolved_user_dir = user_dir or (Path.home() / ".willow")
+    files: list[ContextFile] = []
+    seen: set[Path] = set()
+
+    for directory in (resolved_user_dir,):
+        context = _load_first_context_file(directory)
+        if context is not None and context.path not in seen:
+            files.append(context)
+            seen.add(context.path)
+
+    for directory in _ancestor_dirs(resolved_cwd):
+        for candidate_dir in (directory, directory / ".willow"):
+            context = _load_first_context_file(candidate_dir)
+            if context is not None and context.path not in seen:
+                files.append(context)
+                seen.add(context.path)
+
+    return files
+
+
+def _format_tools(tools_by_name: Mapping[str, Tool]) -> str:
+    if not tools_by_name:
+        return "(none)"
+    return "\n".join(
+        f"- {name}: {tool.description}" for name, tool in tools_by_name.items()
+    )
+
+
+def _guidelines(
+    tools_by_name: Mapping[str, Tool],
+    permission_mode: PermissionMode,
+) -> list[str]:
+    names = set(tools_by_name)
+    guidelines: list[str] = []
+
+    if "bash" in names and "grep" in names:
+        guidelines.append(
+            "Use grep for content searches before broad shell searches; use bash "
+            "for general shell commands."
+        )
+    elif "bash" in names:
+        guidelines.append("Use bash for file operations like ls, rg, find")
+
+    if "read" in names and "edit" in names:
+        guidelines.append("Use read to examine files before editing.")
+    if "edit" in names:
+        guidelines.append("Use edit for precise changes (old text must match exactly)")
+    if "write" in names:
+        guidelines.append("Use write only for new files or complete rewrites")
+    if "edit" in names or "write" in names:
+        guidelines.append(
+            "When summarizing your actions, output plain text directly; do not use "
+            "bash to display what you did."
+        )
+
+    if permission_mode == PermissionMode.READ_ONLY:
+        guidelines.append(
+            "Read-only mode is active. Do not attempt write, edit, or mutating "
+            "shell operations."
+        )
+
+    guidelines.append("Be concise in your responses")
+    guidelines.append("Show file paths clearly when working with files")
+    return guidelines
+
+
+def _format_guidelines(guidelines: Sequence[str]) -> str:
+    seen: set[str] = set()
+    rendered: list[str] = []
+    for guideline in guidelines:
+        normalized = guideline.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        rendered.append(f"- {normalized}")
+    return "\n".join(rendered)
+
+
+def _format_context_files(context_files: Sequence[ContextFile]) -> str:
+    if not context_files:
+        return ""
+
+    parts = [
+        "# Project Context",
+        "",
+        "Project-specific instructions and guidelines:",
+        "",
+    ]
+    for context_file in context_files:
+        parts.append(f"## {context_file.path}")
+        parts.append("")
+        parts.append(context_file.content.rstrip())
+        parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+def format_skills_for_system_prompt(skills: Sequence[Any]) -> str:
+    """Format skill metadata for model-visible discovery.
+
+    The full skill body is intentionally not inlined here. The model sees the
+    skill name, description, and location; direct slash skill invocation can
+    include the full file content in the user turn.
+    """
+
+    if not skills:
+        return ""
+
+    lines = [
+        "The following skills provide specialized instructions for specific tasks.",
+        "Use a skill when the task matches its description.",
+        "",
+        "<available_skills>",
+    ]
+    for skill in skills:
+        lines.extend(
+            [
+                "  <skill>",
+                f"    <name>{_escape_xml(skill.name)}</name>",
+                f"    <description>{_escape_xml(skill.description)}</description>",
+                f"    <location>{_escape_xml(str(skill.path))}</location>",
+                "  </skill>",
+            ]
+        )
+    lines.append("</available_skills>")
+    return "\n".join(lines)
+
+
+def build_system_prompt(
+    *,
+    tools_by_name: Mapping[str, Tool],
+    context_files: Sequence[ContextFile] | None = None,
+    skills: Sequence[Any] | None = None,
+    cwd: Path | None = None,
+    permission_mode: PermissionMode = PermissionMode.YOLO,
+    current_date: date | None = None,
+) -> str:
+    resolved_cwd = (cwd or Path.cwd()).resolve()
+    today = current_date or date.today()
+    loaded_context_files = (
+        list(context_files)
+        if context_files is not None
+        else load_context_files(cwd=resolved_cwd)
+    )
+
+    sections = [
+        DEFAULT_SYSTEM_PROMPT,
+        f"Available tools:\n{_format_tools(tools_by_name)}",
+        (
+            "In addition to the tools above, you may have access to other custom "
+            "tools depending on the project."
+        ),
+        (
+            "Guidelines:\n"
+            f"{_format_guidelines(_guidelines(tools_by_name, permission_mode))}"
+        ),
+    ]
+
+    context = _format_context_files(loaded_context_files)
+    if context:
+        sections.append(context)
+
+    skills_prompt = format_skills_for_system_prompt(skills or [])
+    if skills_prompt:
+        sections.append(skills_prompt)
+
+    sections.append(f"Current date: {today.isoformat()}")
+    sections.append(f"Current working directory: {resolved_cwd}")
+    return "\n\n".join(section for section in sections if section)
+
+
+def _escape_xml(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )

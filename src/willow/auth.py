@@ -1,0 +1,596 @@
+"""Credential auth for Willow.
+
+Reads vendor credentials from Willow's canonical JSON file at
+``~/.willow/auth.json``. OpenAI can also use a Codex OAuth access token from
+``~/.codex/auth.json`` when Willow auth is missing or has no OpenAI entry.
+
+Canonical file format::
+
+    {
+      "anthropic": {
+        "api_key": {"api_key": "sk-ant-..."}
+      },
+      "openai": {
+        "oauth": {
+          "access_token": "...",
+          "refresh_token": "...",
+          "token_url": "...",
+          "client_id": "...",
+          "expires_at": 1779133973
+        }
+      }
+    }
+
+The top-level keys are vendors (``"anthropic"``, ``"openai"``). Each value is
+an object containing auth method objects: ``"api_key"`` or ``"oauth"``. If a
+vendor has both, OAuth is used by default. Legacy flat entries are still
+accepted for compatibility.
+
+Both OpenAI providers (Chat Completions and Responses) share one OpenAI key,
+hence the vendor name ``"openai"`` rather than provider-specific names.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+from urllib import error, parse, request
+
+# Module-level constant. Importable AND monkeypatchable: tests and alternate
+# entry points override this attribute to redirect reads.
+AUTH_PATH: Path = Path.home() / ".willow" / "auth.json"
+CODEX_AUTH_PATH: Path = Path.home() / ".codex" / "auth.json"
+OAUTH_REFRESH_SKEW_SECONDS = 300
+
+_PROVIDER_OAUTH_DEFAULTS: dict[str, dict[str, str]] = {
+    "openai": {
+        "token_url": "https://auth.openai.com/oauth/token",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+    },
+}
+
+
+_EXPECTED_SHAPE = (
+    '{\n'
+    '  "anthropic": {"api_key": {"api_key": "sk-ant-..."}},\n'
+    '  "openai": {"oauth": {"access_token": "...", "refresh_token": "..."}}\n'
+    '}'
+)
+
+
+@dataclass(frozen=True)
+class AuthCredential:
+    """A provider-ready bearer credential.
+
+    ``bearer_token`` is intentionally hidden from ``repr`` so test failures and
+    logs do not leak API keys or OAuth access tokens.
+    """
+
+    kind: Literal["api_key", "oauth"]
+    bearer_token: str = field(repr=False)
+    source: str
+    expires_at: int | None = None
+
+
+def load_auth() -> dict:
+    """Read and parse :data:`AUTH_PATH`. Return the parsed JSON object.
+
+    Raises:
+        FileNotFoundError: If :data:`AUTH_PATH` does not exist. The message
+            includes the expected path and the expected JSON shape.
+        ValueError: If the file exists but is not valid JSON, or if the
+            top-level value is not a JSON object. The message includes the
+            path and the expected shape.
+    """
+    path = AUTH_PATH
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Willow auth file not found at {path}. "
+            f"Create it with the following shape:\n{_EXPECTED_SHAPE}"
+        ) from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Willow auth file at {path} is not valid JSON: {exc.msg} "
+            f"(line {exc.lineno}, column {exc.colno}). "
+            f"Expected shape:\n{_EXPECTED_SHAPE}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Willow auth file at {path} must contain a JSON object at the "
+            f"top level, got {type(data).__name__}. "
+            f"Expected shape:\n{_EXPECTED_SHAPE}"
+        )
+
+    return data
+
+
+def _load_json_object(path: Path, *, label: str) -> dict:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{label} auth file at {path} is not valid JSON: {exc.msg} "
+            f"(line {exc.lineno}, column {exc.colno})."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{label} auth file at {path} must contain a JSON object at the "
+            f"top level, got {type(data).__name__}."
+        )
+
+    return data
+
+
+def _jwt_payload(token: str) -> dict[str, object] | None:
+    """Decode a JWT payload without validating its signature.
+
+    This is only used to read non-sensitive metadata such as ``exp`` so Willow
+    can reject obviously expired OAuth access tokens before SDK construction.
+    """
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        parsed = json.loads(decoded)
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _jwt_expires_at(token: str) -> int | None:
+    payload = _jwt_payload(token)
+    if payload is None:
+        return None
+
+    exp = payload.get("exp")
+    if isinstance(exp, int):
+        return exp
+    if isinstance(exp, float):
+        return int(exp)
+    return None
+
+
+def _coerce_expires_at(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _oauth_expires_at(token_map: dict) -> int | None:
+    expires_at = _coerce_expires_at(token_map.get("expires_at"))
+    if expires_at is not None:
+        return expires_at
+
+    access_token = token_map.get("access_token")
+    if isinstance(access_token, str):
+        return _jwt_expires_at(access_token)
+    return None
+
+
+def _oauth_needs_refresh(token_map: dict) -> bool:
+    expires_at = _oauth_expires_at(token_map)
+    if expires_at is None:
+        return False
+    return expires_at <= int(time.time()) + OAUTH_REFRESH_SKEW_SECONDS
+
+
+def _oauth_string(
+    token_map: dict,
+    key: str,
+    *,
+    vendor: str,
+    path: Path,
+    default: str | None = None,
+) -> str:
+    value = token_map.get(key, default)
+    if isinstance(value, str) and value:
+        return value
+    raise KeyError(
+        f"OAuth credential for vendor {vendor!r} in {path} needs a non-empty "
+        f"{key!r} field to refresh."
+    )
+
+
+def _request_oauth_refresh(
+    *,
+    token_url: str,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str | None = None,
+    scope: str | None = None,
+) -> dict:
+    form: dict[str, str] = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    if client_secret:
+        form["client_secret"] = client_secret
+    if scope:
+        form["scope"] = scope
+
+    req = request.Request(
+        token_url,
+        data=parse.urlencode(form).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(
+            f"OAuth refresh endpoint returned HTTP {exc.code}: {detail}"
+        ) from exc
+    except error.URLError as exc:
+        raise ValueError(f"OAuth refresh request failed: {exc.reason}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("OAuth refresh endpoint returned invalid JSON.") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("OAuth refresh endpoint returned a non-object JSON response.")
+    return data
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.chmod(0o600)
+    tmp_path.replace(path)
+
+
+def _apply_oauth_refresh_response(
+    *,
+    vendor: str,
+    path: Path,
+    token_map: dict,
+    response: dict,
+) -> None:
+    access_token = response.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise ValueError(
+            f"OAuth refresh response for vendor {vendor!r} from {path} did not "
+            f"include a non-empty access_token."
+        )
+
+    token_map["access_token"] = access_token
+
+    refresh_token = response.get("refresh_token")
+    if isinstance(refresh_token, str) and refresh_token:
+        token_map["refresh_token"] = refresh_token
+
+    expires_at = _jwt_expires_at(access_token)
+    expires_in = response.get("expires_in")
+    if expires_at is None and isinstance(expires_in, int | float):
+        expires_at = int(time.time()) + int(expires_in)
+    if expires_at is not None:
+        token_map["expires_at"] = expires_at
+
+
+def _refresh_oauth_token_map_if_needed(
+    *,
+    vendor: str,
+    path: Path,
+    token_map: dict,
+    root_data: dict,
+) -> None:
+    if not _oauth_needs_refresh(token_map):
+        return
+
+    defaults = _PROVIDER_OAUTH_DEFAULTS.get(vendor, {})
+    token_url = _oauth_string(
+        token_map,
+        "token_url",
+        vendor=vendor,
+        path=path,
+        default=defaults.get("token_url"),
+    )
+    client_id = _oauth_string(
+        token_map,
+        "client_id",
+        vendor=vendor,
+        path=path,
+        default=defaults.get("client_id"),
+    )
+    refresh_token = _oauth_string(token_map, "refresh_token", vendor=vendor, path=path)
+
+    client_secret = token_map.get("client_secret")
+    if not isinstance(client_secret, str):
+        client_secret = None
+    scope = token_map.get("scope")
+    if not isinstance(scope, str):
+        scope = None
+
+    response = _request_oauth_refresh(
+        token_url=token_url,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        scope=scope,
+    )
+    _apply_oauth_refresh_response(
+        vendor=vendor,
+        path=path,
+        token_map=token_map,
+        response=response,
+    )
+    _write_json_atomic(path, root_data)
+
+
+def _oauth_credential_from_token_map(
+    *,
+    vendor: str,
+    path: Path,
+    token_map: dict,
+    source: str,
+) -> AuthCredential:
+    access_token = token_map.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise KeyError(
+            f"OAuth credential for vendor {vendor!r} in {path} is missing a "
+            f"non-empty 'access_token' field."
+        )
+
+    expires_at = _oauth_expires_at(token_map)
+
+    return AuthCredential(
+        kind="oauth",
+        bearer_token=access_token,
+        source=source,
+        expires_at=expires_at,
+    )
+
+
+def _oauth_credential_from_vendor_entry(
+    *,
+    vendor: str,
+    path: Path,
+    entry: dict,
+) -> AuthCredential | None:
+    nested = entry.get("oauth")
+    if nested is not None:
+        if not isinstance(nested, dict):
+            raise KeyError(
+                f"'oauth' for vendor {vendor!r} in {path} must be an object, "
+                f"got {type(nested).__name__}."
+            )
+        return _oauth_credential_from_token_map(
+            vendor=vendor,
+            path=path,
+            token_map=nested,
+            source=f"{path} {vendor}.oauth",
+        )
+
+    # Legacy flat OAuth shape from early Willow builds.
+    if entry.get("auth_type") == "oauth":
+        return _oauth_credential_from_token_map(
+            vendor=vendor,
+            path=path,
+            token_map=entry,
+            source=str(path),
+        )
+
+    # Legacy Codex-shaped OpenAI entry.
+    tokens = entry.get("tokens")
+    if isinstance(tokens, dict):
+        return _oauth_credential_from_token_map(
+            vendor=vendor,
+            path=path,
+            token_map=tokens,
+            source=f"{path} {vendor}.tokens",
+        )
+
+    return None
+
+
+def _api_key_credential_from_vendor_entry(
+    *,
+    vendor: str,
+    path: Path,
+    entry: dict,
+) -> AuthCredential | None:
+    api_key_entry = entry.get("api_key")
+    if api_key_entry is None:
+        return None
+
+    if isinstance(api_key_entry, dict):
+        api_key = api_key_entry.get("api_key")
+        source = f"{path} {vendor}.api_key"
+    else:
+        # Legacy flat API-key shape from early Willow builds.
+        api_key = api_key_entry
+        source = str(path)
+
+    if isinstance(api_key, str) and api_key:
+        return AuthCredential(kind="api_key", bearer_token=api_key, source=source)
+
+    raise KeyError(
+        f"'api_key' for vendor {vendor!r} in {path} must contain a non-empty "
+        f"string field named 'api_key', got {type(api_key).__name__!r}."
+    )
+
+
+def _codex_oauth_credential() -> AuthCredential | None:
+    path = CODEX_AUTH_PATH
+    try:
+        data = _load_json_object(path, label="Codex")
+    except FileNotFoundError:
+        return None
+
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+
+    _refresh_oauth_token_map_if_needed(
+        vendor="openai",
+        path=path,
+        token_map=tokens,
+        root_data=data,
+    )
+
+    return _oauth_credential_from_token_map(
+        vendor="openai",
+        path=path,
+        token_map=tokens,
+        source=f"{path} tokens",
+    )
+
+
+def _missing_vendor_error(vendor: str, path: Path) -> KeyError:
+    return KeyError(
+        f"Vendor {vendor!r} not found in Willow auth file at {path}. "
+        f"Add an entry like {{{vendor!r}: {{'api_key': {{'api_key': '...'}}}}}} "
+        f"to that file."
+    )
+
+
+def get_credential(vendor: str) -> AuthCredential:
+    """Return a provider-ready credential for ``vendor``.
+
+    Each vendor entry should contain method objects: ``api_key`` or ``oauth``.
+    If both are present, OAuth is used by default. OpenAI also falls back to
+    Codex's local OAuth login when Willow has no OpenAI credential.
+
+    Raises:
+        KeyError: If ``vendor`` is not configured, or its entry is malformed.
+        FileNotFoundError: If the Willow auth file is missing and no supported
+            fallback credential is available.
+        ValueError: If a credential file is malformed JSON.
+    """
+    path = AUTH_PATH
+
+    try:
+        data = load_auth()
+    except FileNotFoundError:
+        if vendor == "openai":
+            codex_credential = _codex_oauth_credential()
+            if codex_credential is not None:
+                return codex_credential
+        raise
+
+    if vendor not in data:
+        if vendor == "openai":
+            codex_credential = _codex_oauth_credential()
+            if codex_credential is not None:
+                return codex_credential
+        raise _missing_vendor_error(vendor, path)
+
+    entry = data[vendor]
+    if not isinstance(entry, dict):
+        raise KeyError(
+            f"Entry for vendor {vendor!r} in {path} must be an object with "
+            f"an 'api_key' or 'oauth' method object, got {type(entry).__name__}."
+        )
+
+    has_oauth = "oauth" in entry
+
+    credential = _oauth_credential_from_vendor_entry(
+        vendor=vendor,
+        path=path,
+        entry=entry,
+    )
+    if credential is not None and has_oauth:
+        oauth_entry = entry["oauth"]
+        if not isinstance(oauth_entry, dict):
+            raise KeyError(
+                f"'oauth' for vendor {vendor!r} in {path} must be an object, "
+                f"got {type(oauth_entry).__name__}."
+            )
+        _refresh_oauth_token_map_if_needed(
+            vendor=vendor,
+            path=path,
+            token_map=oauth_entry,
+            root_data=data,
+        )
+        return _oauth_credential_from_token_map(
+            vendor=vendor,
+            path=path,
+            token_map=oauth_entry,
+            source=f"{path} {vendor}.oauth",
+        )
+
+    if credential is not None and entry.get("auth_type") == "oauth":
+        _refresh_oauth_token_map_if_needed(
+            vendor=vendor,
+            path=path,
+            token_map=entry,
+            root_data=data,
+        )
+        return _oauth_credential_from_token_map(
+            vendor=vendor,
+            path=path,
+            token_map=entry,
+            source=str(path),
+        )
+
+    api_key_credential = _api_key_credential_from_vendor_entry(
+        vendor=vendor,
+        path=path,
+        entry=entry,
+    )
+    if api_key_credential is not None:
+        return api_key_credential
+
+    if credential is not None:
+        return credential
+
+    if "api_key" not in entry:
+        raise KeyError(
+            f"Vendor {vendor!r} in Willow auth file at {path} is missing the "
+            f"'api_key' or 'oauth' method object. Add it: "
+            f"{{{vendor!r}: {{'api_key': {{'api_key': '...'}}}}}}."
+        )
+    raise KeyError(
+        f"Vendor {vendor!r} in Willow auth file at {path} does not contain a "
+        f"usable 'api_key' or 'oauth' credential."
+    )
+
+
+def get_api_key(vendor: str) -> str:
+    """Return the provider bearer token for ``vendor``.
+
+    This compatibility wrapper returns API keys for API-key credentials and
+    OAuth access tokens for OAuth credentials. New code should use
+    :func:`get_credential` when it needs to distinguish credential kinds.
+
+    Raises:
+        KeyError: If ``vendor`` is not configured, or its entry is malformed.
+        FileNotFoundError: If the Willow auth file is missing and no supported
+            fallback credential is available.
+        ValueError: If a credential file is malformed JSON.
+    """
+    return get_credential(vendor).bearer_token
