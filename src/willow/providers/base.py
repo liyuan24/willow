@@ -326,3 +326,11 @@ class Provider(ABC):
         complete().
         """
         ...
+
+    def reset_conversation(self) -> None:
+        """Forget provider-side continuation state, if any.
+
+        Stateless providers can ignore this. Stateful providers use it when
+        Willow replaces the raw transcript with a compacted request projection.
+        """
+        return

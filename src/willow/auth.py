@@ -33,9 +33,18 @@ hence the vendor name ``"openai"`` rather than provider-specific names.
 from __future__ import annotations
 
 import base64
+import contextlib
+import hashlib
+import html
 import json
+import queue
+import secrets
+import threading
 import time
+import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Literal
 from urllib import error, parse, request
@@ -45,11 +54,17 @@ from urllib import error, parse, request
 AUTH_PATH: Path = Path.home() / ".willow" / "auth.json"
 CODEX_AUTH_PATH: Path = Path.home() / ".codex" / "auth.json"
 OAUTH_REFRESH_SKEW_SECONDS = 300
+OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OPENAI_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
+OPENAI_CODEX_SCOPE = "openid profile email offline_access"
+OPENAI_CODEX_AUTH_CLAIM_PATH = "https://api.openai.com/auth"
 
 _PROVIDER_OAUTH_DEFAULTS: dict[str, dict[str, str]] = {
     "openai": {
-        "token_url": "https://auth.openai.com/oauth/token",
-        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "token_url": OPENAI_CODEX_TOKEN_URL,
+        "client_id": OPENAI_CODEX_CLIENT_ID,
     },
 }
 
@@ -171,6 +186,78 @@ def _jwt_expires_at(token: str) -> int | None:
     return None
 
 
+def _base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _generate_pkce() -> tuple[str, str]:
+    verifier = _base64url(secrets.token_bytes(32))
+    challenge = _base64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
+
+def _build_openai_codex_authorization_url(
+    *,
+    challenge: str,
+    state: str,
+    originator: str = "willow",
+) -> str:
+    params = {
+        "response_type": "code",
+        "client_id": OPENAI_CODEX_CLIENT_ID,
+        "redirect_uri": OPENAI_CODEX_REDIRECT_URI,
+        "scope": OPENAI_CODEX_SCOPE,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "originator": originator,
+    }
+    return f"{OPENAI_CODEX_AUTHORIZE_URL}?{parse.urlencode(params)}"
+
+
+def _parse_authorization_input(value: str) -> tuple[str | None, str | None]:
+    raw = value.strip()
+    if not raw:
+        return None, None
+
+    try:
+        parsed_url = parse.urlparse(raw)
+    except ValueError:
+        parsed_url = parse.ParseResult("", "", "", "", "", "")
+    if parsed_url.scheme and parsed_url.netloc:
+        params = parse.parse_qs(parsed_url.query)
+        code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
+        return code, state
+
+    if "#" in raw:
+        code, state = raw.split("#", 1)
+        return code or None, state or None
+
+    if "code=" in raw:
+        params = parse.parse_qs(raw)
+        code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
+        return code, state
+
+    return raw, None
+
+
+def _openai_codex_account_id(access_token: str) -> str | None:
+    payload = _jwt_payload(access_token)
+    auth_claim = (
+        payload.get(OPENAI_CODEX_AUTH_CLAIM_PATH)
+        if payload is not None
+        else None
+    )
+    if not isinstance(auth_claim, dict):
+        return None
+    account_id = auth_claim.get("chatgpt_account_id")
+    return account_id if isinstance(account_id, str) and account_id else None
+
+
 def _coerce_expires_at(value: object) -> int | None:
     if isinstance(value, int):
         return value
@@ -262,6 +349,48 @@ def _request_oauth_refresh(
     return data
 
 
+def _request_openai_codex_token(
+    *,
+    code: str,
+    verifier: str,
+) -> dict:
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": OPENAI_CODEX_CLIENT_ID,
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": OPENAI_CODEX_REDIRECT_URI,
+    }
+    req = request.Request(
+        OPENAI_CODEX_TOKEN_URL,
+        data=parse.urlencode(form).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(
+            f"OpenAI Codex OAuth token endpoint returned HTTP {exc.code}: {detail}"
+        ) from exc
+    except error.URLError as exc:
+        raise ValueError(f"OpenAI Codex OAuth token request failed: {exc.reason}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("OpenAI Codex OAuth token endpoint returned invalid JSON.") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("OpenAI Codex OAuth token endpoint returned a non-object response.")
+    return data
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
@@ -271,6 +400,98 @@ def _write_json_atomic(path: Path, data: dict) -> None:
     )
     tmp_path.chmod(0o600)
     tmp_path.replace(path)
+
+
+def _success_html(message: str) -> bytes:
+    escaped = html.escape(message)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Authentication successful</title></head>"
+        f"<body><h1>Authentication successful</h1><p>{escaped}</p></body></html>"
+    ).encode()
+
+
+def _error_html(message: str) -> bytes:
+    escaped = html.escape(message)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Authentication failed</title></head>"
+        f"<body><h1>Authentication failed</h1><p>{escaped}</p></body></html>"
+    ).encode()
+
+
+class _OpenAICodexCallbackServer:
+    def __init__(self, *, state: str) -> None:
+        self._codes: queue.Queue[str | None] = queue.Queue(maxsize=1)
+        codes = self._codes
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                parsed = parse.urlparse(self.path)
+                if parsed.path != "/auth/callback":
+                    self._respond(404, _error_html("Callback route not found."))
+                    return
+
+                params = parse.parse_qs(parsed.query)
+                if params.get("state", [None])[0] != state:
+                    self._respond(400, _error_html("State mismatch."))
+                    return
+
+                code = params.get("code", [None])[0]
+                if not code:
+                    self._respond(400, _error_html("Missing authorization code."))
+                    return
+
+                self._respond(
+                    200,
+                    _success_html(
+                        "OpenAI authentication completed. You can close this window."
+                    ),
+                )
+                with contextlib.suppress(queue.Full):
+                    codes.put_nowait(code)
+
+            def _respond(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 1455), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wait(self, timeout: float) -> str | None:
+        try:
+            return self._codes.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=1)
+
+
+def _start_openai_codex_callback_server(
+    *,
+    state: str,
+) -> _OpenAICodexCallbackServer | None:
+    try:
+        server = _OpenAICodexCallbackServer(state=state)
+    except OSError:
+        return None
+    server.start()
+    return server
 
 
 def _apply_oauth_refresh_response(
@@ -299,6 +520,111 @@ def _apply_oauth_refresh_response(
         expires_at = int(time.time()) + int(expires_in)
     if expires_at is not None:
         token_map["expires_at"] = expires_at
+
+
+def _openai_codex_token_map_from_response(response: dict) -> dict[str, object]:
+    access_token = response.get("access_token")
+    refresh_token = response.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise ValueError("OpenAI Codex OAuth response did not include access_token.")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise ValueError("OpenAI Codex OAuth response did not include refresh_token.")
+    account_id = _openai_codex_account_id(access_token)
+    if account_id is None:
+        raise ValueError("OpenAI Codex OAuth token is missing chatgpt_account_id.")
+
+    expires_at = _jwt_expires_at(access_token)
+    expires_in = response.get("expires_in")
+    if expires_at is None and isinstance(expires_in, int | float):
+        expires_at = int(time.time()) + int(expires_in)
+
+    token_map: dict[str, object] = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_url": OPENAI_CODEX_TOKEN_URL,
+        "client_id": OPENAI_CODEX_CLIENT_ID,
+        "scope": OPENAI_CODEX_SCOPE,
+        "account_id": account_id,
+    }
+    if expires_at is not None:
+        token_map["expires_at"] = expires_at
+    return token_map
+
+
+def save_openai_codex_oauth(token_map: dict[str, object]) -> AuthCredential:
+    """Persist OpenAI Codex OAuth credentials into Willow's auth file."""
+    path = AUTH_PATH
+    try:
+        data = load_auth()
+    except FileNotFoundError:
+        data = {}
+
+    entry = data.get("openai")
+    if entry is None:
+        entry = {}
+        data["openai"] = entry
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"Entry for vendor 'openai' in {path} must be an object, "
+            f"got {type(entry).__name__}."
+        )
+
+    entry["oauth"] = dict(token_map)
+    _write_json_atomic(path, data)
+    return _oauth_credential_from_token_map(
+        vendor="openai",
+        path=path,
+        token_map=entry["oauth"],
+        source=f"{path} openai.oauth",
+    )
+
+
+def login_openai_codex(
+    *,
+    on_auth: Callable[[str], None] | None = None,
+    prompt: Callable[[str], str] = input,
+    open_browser: Callable[[str], bool] | None = webbrowser.open,
+    callback_timeout_seconds: float = 300,
+    originator: str = "willow",
+) -> AuthCredential:
+    """Run the OpenAI Codex OAuth flow and persist the resulting credential.
+
+    This is intentionally OpenAI Codex-only. Willow stores the resulting token
+    under ``openai.oauth`` because ``openai_codex`` is wired through the existing
+    OpenAI vendor credential path.
+    """
+    verifier, challenge = _generate_pkce()
+    state = secrets.token_hex(16)
+    auth_url = _build_openai_codex_authorization_url(
+        challenge=challenge,
+        state=state,
+        originator=originator,
+    )
+    server = _start_openai_codex_callback_server(state=state)
+
+    try:
+        if on_auth is not None:
+            on_auth(auth_url)
+        if open_browser is not None:
+            with contextlib.suppress(Exception):
+                open_browser(auth_url)
+
+        code = server.wait(callback_timeout_seconds) if server is not None else None
+        if code is None:
+            raw = prompt("Paste the authorization code or full redirect URL: ")
+            code, pasted_state = _parse_authorization_input(raw)
+            if pasted_state is not None and pasted_state != state:
+                raise ValueError("OpenAI Codex OAuth state mismatch.")
+
+        if not code:
+            raise ValueError("OpenAI Codex OAuth did not return an authorization code.")
+
+        token_response = _request_openai_codex_token(code=code, verifier=verifier)
+        token_map = _openai_codex_token_map_from_response(token_response)
+        return save_openai_codex_oauth(token_map)
+    finally:
+        if server is not None:
+            server.close()
 
 
 def _refresh_oauth_token_map_if_needed(

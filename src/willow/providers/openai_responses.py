@@ -292,6 +292,10 @@ class OpenAIResponsesProvider(Provider):
         # assistant message (typically the user tool_result message).
         self._seen_messages_count = len(request.messages) + 1
 
+    def reset_conversation(self) -> None:
+        self._previous_response_id = None
+        self._seen_messages_count = 0
+
 
 # Any: SDK Response object — we read `.usage.input_tokens`, `.output`,
 # `.status`. The Responses SDK exposes a union of vendor-private types here

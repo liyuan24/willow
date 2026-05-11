@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from willow import session, tui
+from willow import auth, session, tui
 from willow.models import ModelChoice
 from willow.providers import (
     CompletionRequest,
@@ -44,6 +44,15 @@ class _ScriptedStreamProvider(Provider):
         if not self._scripts:
             raise RuntimeError("provider exhausted")
         yield from self._scripts.popleft()
+
+
+class _ResettableScriptedStreamProvider(_ScriptedStreamProvider):
+    def __init__(self, scripts: list[list[Any]]) -> None:
+        super().__init__(scripts)
+        self.reset_count = 0
+
+    def reset_conversation(self) -> None:
+        self.reset_count += 1
 
 
 class _RecordingTool(Tool):
@@ -124,6 +133,13 @@ def _session_record(
             max_iterations=6,
         ),
         messages=[Message(role="user", content=[TextBlock(text=text)])],
+    )
+
+
+def _text_message(index: int, text: str) -> Message:
+    return Message(
+        role="user" if index % 2 else "assistant",
+        content=[TextBlock(text=text)],
     )
 
 
@@ -726,6 +742,36 @@ def test_live_prompt_wraps_long_input_across_lines() -> None:
     assert "\x1b[8C\x1b[?25h" in rendered
 
 
+def test_live_prompt_clear_accounts_for_terminal_zoom_in() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    widths = [20]
+    app._terminal_width = lambda: widths[-1]  # type: ignore[method-assign]
+    live = tui._LiveTerminal(app)
+
+    live._draw_prompt()
+    out.seek(0)
+    out.truncate(0)
+    widths.append(10)
+    live._draw_prompt()
+
+    rendered = out.getvalue()
+    assert rendered.count("\x1b[1A\r\x1b[2K") >= 3
+    assert live.prompt_width == 10
+
+
+def test_welcome_card_keeps_compact_width() -> None:
+    out = io.StringIO()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._terminal_width = lambda: 120  # type: ignore[method-assign]
+
+    app._write_welcome_card()
+
+    first_line = out.getvalue().splitlines()[0]
+    assert len(first_line) == 36
+
+
 def test_live_prompt_shows_slash_command_hints_for_prefix() -> None:
     out = _TTYBuffer()
     app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
@@ -904,6 +950,78 @@ def test_live_prompt_shows_model_picker_for_model_command(
     assert rendered.index(" > /model") < rendered.index("gpt-5.5")
     assert "/model  choose what model to use" not in rendered
     assert "tokens:" not in rendered
+
+
+def test_live_prompt_shows_login_picker_for_login_command() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.buffer = "/login"
+    live.cursor = len(live.buffer)
+
+    live._draw_prompt()
+
+    rendered = out.getvalue()
+    assert " > /login" in rendered
+    assert "openai-codex" in rendered
+    assert "ChatGPT Plus/Pro Codex OAuth" in rendered
+    assert tui.SELECTED_ROW_STYLE in rendered
+    assert rendered.index(" > /login") < rendered.index("openai-codex")
+    assert "/login  authenticate OpenAI Codex with OAuth" not in rendered
+
+
+def test_live_prompt_shows_auto_compacting_status() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.compacting = True
+
+    live._draw_prompt()
+
+    rendered = out.getvalue()
+    assert "Auto-compacting..." in rendered
+    assert tui.COMPACTION_STYLE in rendered
+
+
+def test_live_login_picker_enter_logs_in_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_handle_login(provider: str) -> None:
+        calls.append(provider)
+
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    app._handle_login = fake_handle_login  # type: ignore[method-assign]
+    live = tui._LiveTerminal(app)
+    live.buffer = "/login"
+    live.cursor = len(live.buffer)
+
+    live._submit_buffer()
+
+    assert calls == ["openai-codex"]
+    assert live.buffer == ""
+    assert app.messages == []
+
+
+def test_live_tab_completes_selected_login_provider_without_submitting() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.buffer = "/login"
+    live.cursor = len(live.buffer)
+
+    completed = live._complete_selected_hint()
+
+    assert completed is True
+    assert live.buffer == "/login openai-codex"
+    assert live.cursor == len(live.buffer)
+    assert app.messages == []
 
 
 def test_live_model_picker_moves_highlight_with_up_and_down(
@@ -1467,10 +1585,21 @@ def test_terminal_skill_command_expands_user_message(
 
 
 def test_terminal_project_hello_world_skill_works(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo_root = Path(__file__).resolve().parent.parent
-    monkeypatch.chdir(repo_root)
+    skill_path = tmp_path / ".willow" / "skills" / "hello_world" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\n"
+        "name: hello_world\n"
+        "description: Respond with a concise hello world confirmation.\n"
+        "---\n\n"
+        "# Hello World\n\n"
+        "When invoked, respond with a concise confirmation.",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
     response = CompletionResponse(
         content=[TextBlock(text="done")],
         stop_reason="end_turn",
@@ -1638,6 +1767,93 @@ def test_terminal_status_command_shows_disabled_persistence() -> None:
 
     assert "[status] persistence: disabled" in out
     assert "session: (not saved)" in out
+
+
+def test_terminal_login_openai_codex(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_login(**kwargs: object) -> auth.AuthCredential:
+        calls.append(kwargs)
+        on_auth = kwargs["on_auth"]
+        assert callable(on_auth)
+        on_auth("https://auth.example/login")
+        return auth.AuthCredential(
+            kind="oauth",
+            bearer_token="access-token",
+            source="/tmp/auth.json openai.oauth",
+            expires_at=2_000_000_000,
+        )
+
+    monkeypatch.setattr(tui, "login_openai_codex", fake_login)
+
+    out, _app = _drive(_ScriptedStreamProvider([]), ["/login", "/exit"])
+
+    assert len(calls) == 1
+    assert calls[0]["originator"] == "willow"
+    assert "Open this URL to authenticate OpenAI Codex" in out
+    assert "https://auth.example/login" in out
+    assert "OpenAI Codex OAuth saved to /tmp/auth.json openai.oauth" in out
+
+
+def test_terminal_compaction_uses_projection_but_persists_full_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(session.SESSION_DIR_ENV, str(tmp_path / "sessions"))
+    monkeypatch.setattr(tui, "_context_window_for_model", lambda _model: 100)
+    prior_messages = [_text_message(index, "history " + ("x" * 80)) for index in range(24)]
+    summary_response = CompletionResponse(
+        content=[TextBlock(text="middle summary")],
+        stop_reason="end_turn",
+    )
+    final_response = CompletionResponse(
+        content=[TextBlock(text="final answer")],
+        stop_reason="end_turn",
+    )
+    provider = _ResettableScriptedStreamProvider(
+        [
+            [StreamComplete(response=summary_response)],
+            [TextDelta(text="final answer"), StreamComplete(response=final_response)],
+        ]
+    )
+    args = _make_args(persist_session=True)
+    inputs = iter(["new user request", "/exit"])
+
+    def input_func(_prompt: str = "") -> str:
+        try:
+            return next(inputs)
+        except StopIteration as exc:
+            raise EOFError from exc
+
+    out = io.StringIO()
+    app = tui.WillowApp(
+        args,
+        provider,
+        state={"messages": list(prior_messages)},
+        input_func=input_func,
+        out=out,
+    )
+
+    assert app.run() == 0
+
+    assert "[status] Auto-compacting..." in out.getvalue()
+    assert len(provider.requests) == 2
+    compacted_request = provider.requests[1]
+    assert compacted_request.messages[:10] == prior_messages[:10]
+    assert "middle summary" in _message_text(compacted_request.messages[10])
+    assert len(compacted_request.messages) == 21
+    assert provider.reset_count >= 3
+    assert len(app.messages) == 26
+    assert all("middle summary" not in _message_text(message) for message in app.messages)
+    assert app._session_path is not None
+    saved = session.load_session(app._session_path)
+    assert saved.messages == app.messages
+
+
+def _message_text(message: Message) -> str:
+    return "\n".join(
+        block.text for block in message.content if isinstance(block, TextBlock)
+    )
 
 
 def test_terminal_clear_is_append_only_and_resets_history() -> None:

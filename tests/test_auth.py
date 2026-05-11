@@ -24,12 +24,16 @@ def auth_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
-def _jwt_with_exp(exp: int) -> str:
+def _jwt_with_payload(payload: dict[str, object]) -> str:
     def encode(payload: dict[str, object]) -> str:
         raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
-    return f"{encode({'alg': 'none'})}.{encode({'exp': exp})}.signature"
+    return f"{encode({'alg': 'none'})}.{encode(payload)}.signature"
+
+
+def _jwt_with_exp(exp: int) -> str:
+    return _jwt_with_payload({"exp": exp})
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +336,61 @@ def test_get_credential_refreshes_openai_with_provider_defaults(
     assert credential.bearer_token == new_token
     assert seen["token_url"] == "https://auth.openai.com/oauth/token"
     assert seen["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann"
+
+
+def test_login_openai_codex_persists_openai_oauth(
+    auth_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_urls: list[str] = []
+    opened_urls: list[str] = []
+    seen_exchange: dict[str, str] = {}
+
+    monkeypatch.setattr(auth, "_generate_pkce", lambda: ("verifier", "challenge"))
+    monkeypatch.setattr(auth.secrets, "token_hex", lambda _n: "state_123")
+    monkeypatch.setattr(
+        auth,
+        "_start_openai_codex_callback_server",
+        lambda *, state: None,
+    )
+
+    def fake_exchange(**kwargs: str) -> dict[str, object]:
+        seen_exchange.update(kwargs)
+        return {
+            "access_token": _jwt_with_payload(
+                {
+                    "exp": 2_000_000_000,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct_123",
+                    },
+                }
+            ),
+            "refresh_token": "refresh-token",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr(auth, "_request_openai_codex_token", fake_exchange)
+
+    credential = auth.login_openai_codex(
+        on_auth=seen_urls.append,
+        prompt=lambda _message: "code=auth-code&state=state_123",
+        open_browser=lambda url: opened_urls.append(url) is None,
+    )
+
+    saved = json.loads(auth_file.read_text())
+    oauth = saved["openai"]["oauth"]
+    assert credential.kind == "oauth"
+    assert credential.bearer_token == oauth["access_token"]
+    assert oauth["refresh_token"] == "refresh-token"
+    assert oauth["token_url"] == "https://auth.openai.com/oauth/token"
+    assert oauth["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann"
+    assert oauth["scope"] == "openid profile email offline_access"
+    assert oauth["account_id"] == "acct_123"
+    assert seen_exchange == {"code": "auth-code", "verifier": "verifier"}
+    assert len(seen_urls) == 1
+    assert opened_urls == seen_urls
+    assert "code_challenge=challenge" in seen_urls[0]
+    assert "state=state_123" in seen_urls[0]
 
 
 def test_auth_credential_repr_hides_bearer_token() -> None:

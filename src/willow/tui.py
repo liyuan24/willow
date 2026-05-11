@@ -19,6 +19,7 @@ import sys
 import termios
 import textwrap
 import threading
+import time
 import tty
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -26,6 +27,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, TextIO, cast
 
+from willow.auth import login_openai_codex
+from willow.compaction import RuntimeCompaction, maybe_compact_messages
 from willow.loop import dispatch_tool
 from willow.message_history import interrupted_user_text_blocks, queued_user_text_blocks
 from willow.models import (
@@ -81,6 +84,7 @@ SLASH_COMMAND_HINTS: tuple[tuple[str, str], ...] = (
     ("/clear", "reset conversation history"),
     ("/exit", "exit the TUI"),
     ("/help", "show commands and settings"),
+    ("/login", "authenticate OpenAI Codex with OAuth"),
     ("/model", "choose what model to use"),
     ("/quit", "exit the TUI"),
     ("/session", "show persistence and saved session path"),
@@ -88,6 +92,9 @@ SLASH_COMMAND_HINTS: tuple[tuple[str, str], ...] = (
     ("/statusline", "toggle status snapshots in the prompt"),
 )
 BUILTIN_SLASH_COMMANDS = frozenset(command for command, _description in SLASH_COMMAND_HINTS)
+LOGIN_PROVIDER_CHOICES: tuple[tuple[str, str], ...] = (
+    ("openai-codex", "ChatGPT Plus/Pro Codex OAuth"),
+)
 
 MODEL_CONTEXT_TOKENS: dict[str, int] = {
     "gpt-5.5": 1_050_000,
@@ -124,10 +131,12 @@ WELCOME_VALUE_STYLE = "\x1b[38;5;255;1m"
 STATUS_STYLE = "\x1b[48;5;238;38;5;250m"
 STATUS_MODEL_STYLE = "\x1b[48;5;238;38;5;82;1m"
 STATUS_TOKEN_STYLE = "\x1b[48;5;238;38;5;203;1m"
+COMPACTION_STYLE = "\x1b[48;5;54;38;5;231;1m"
 PROMPT_STYLE = "\x1b[48;5;23;38;5;231m"
 ERROR_STYLE = "\x1b[48;5;52;38;5;231m"
 PROMPT_MARKER_STYLE = "\x1b[48;5;23;38;5;51;1m"
 SELECTED_ROW_STYLE = "\x1b[48;5;240;38;5;255;1m"
+COMPACTION_FRAMES = ("◐", "◓", "◑", "◒")
 
 WILLOW_LOGO_LINES: tuple[str, ...] = (
     "   \\ | /   ",
@@ -455,6 +464,27 @@ def _render_model_picker_rows(
     return rows
 
 
+def _render_login_picker_rows(
+    *,
+    selected_index: int,
+    width: int,
+    styles_enabled: bool,
+) -> list[str]:
+    provider_width = max(len(provider) for provider, _description in LOGIN_PROVIDER_CHOICES)
+    rows: list[str] = []
+    for index, (provider, description) in enumerate(LOGIN_PROVIDER_CHOICES):
+        marker = ">" if index == selected_index else " "
+        line = f" {marker} {provider:<{provider_width}}  {description}"
+        line = line[:width].ljust(width)
+        if styles_enabled and index == selected_index:
+            rows.append(f"{SELECTED_ROW_STYLE}{line}{RESET}")
+        elif styles_enabled:
+            rows.append(f"{STATUS_STYLE}{line}{RESET}")
+        else:
+            rows.append(line)
+    return rows
+
+
 def _render_input_hint_rows(
     rows: list[str],
     *,
@@ -551,6 +581,18 @@ def _wrap_terminal_line(line: str, width: int) -> list[str]:
     ) or [""]
 
 
+def _terminal_line_width(width: int) -> int:
+    return max(1, width)
+
+
+def _styled_terminal_line(text: str, style: str, width: int) -> str:
+    visible_width = _terminal_line_width(width)
+    # Temporarily disable terminal autowrap while filling the final column.
+    # This lets prompt rows occupy the full width without creating phantom
+    # wrapped rows that survive terminal zoom/resizes.
+    return f"\x1b[?7l{style}{text[:visible_width].ljust(visible_width)}{RESET}\x1b[?7h"
+
+
 class WillowApp:
     """Append-only native terminal session for Willow."""
 
@@ -601,6 +643,7 @@ class WillowApp:
         self._force_plain = input_func is not None or out is not None
         self._last_transcript_was_separator = False
         self._resume_history_pending = False
+        self._compaction_state: RuntimeCompaction | None = None
 
         if state is not None:
             self._restore_state(state)
@@ -714,6 +757,7 @@ class WillowApp:
             prompt=self._ask_tool_permission,
         )
         self.messages = list(cast(list[Message], state.get("messages", self.messages)))
+        self._compaction_state = None
         self._statusline_enabled = bool(
             state.get("statusline_enabled", self._statusline_enabled)
         )
@@ -735,7 +779,7 @@ class WillowApp:
         for _ in range(self.max_iterations):
             request = CompletionRequest(
                 model=self.current_model,
-                messages=list(self.messages),
+                messages=self._messages_for_request(),
                 max_tokens=self.max_tokens,
                 system=self.system,
                 tools=self.tool_specs,
@@ -762,6 +806,32 @@ class WillowApp:
 
         self._write_line(f"[hit max_iterations={self.max_iterations}; returning control]")
         self._write_status_snapshot()
+
+    def _messages_for_request(
+        self,
+        *,
+        on_compaction_start: Callable[[], None] | None = None,
+        on_compaction_end: Callable[[], None] | None = None,
+    ) -> list[Message]:
+        messages, state = maybe_compact_messages(
+            provider=self.provider,
+            model=self.current_model,
+            system=self.system,
+            messages=self.messages,
+            tools=self.tool_specs,
+            max_tokens=self.max_tokens,
+            context_window=_context_window_for_model(self.current_model),
+            state=self._compaction_state,
+            on_start=on_compaction_start or self._write_auto_compacting_status,
+            on_end=on_compaction_end,
+        )
+        self._compaction_state = state
+        if state is not None:
+            self.provider.reset_conversation()
+        return messages
+
+    def _write_auto_compacting_status(self) -> None:
+        self._write_panel("status", "Auto-compacting...", STATUS_STYLE)
 
     def _drive_stream(self, request: CompletionRequest) -> CompletionResponse:
         final_response: CompletionResponse | None = None
@@ -915,6 +985,7 @@ class WillowApp:
             return True
         if cmd == "/clear":
             self.messages = []
+            self._compaction_state = None
             self._last_context_tokens = None
             self._total_input_tokens = 0
             self._total_cached_tokens = 0
@@ -924,6 +995,9 @@ class WillowApp:
             return False
         if cmd == "/help":
             self._print_help()
+            return False
+        if cmd == "/login":
+            self._handle_login(rest)
             return False
         if cmd in ("/session", "/status"):
             self._write_session_status()
@@ -941,6 +1015,41 @@ class WillowApp:
             return False
         self._write_panel("error", f"Unknown command: {cmd}", ERROR_STYLE)
         return False
+
+    def _handle_login(self, rest: str) -> None:
+        provider = rest.strip() or "openai-codex"
+        if provider != "openai-codex":
+            self._write_panel(
+                "error",
+                "Only /login openai-codex is supported.",
+                ERROR_STYLE,
+            )
+            return
+
+        try:
+            credential = login_openai_codex(
+                on_auth=lambda url: self._write_panel(
+                    "login",
+                    f"Open this URL to authenticate OpenAI Codex:\n{url}",
+                    STATUS_STYLE,
+                ),
+                prompt=self.input_func,
+                originator="willow",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._write_panel("error", f"OpenAI Codex login failed: {exc}", ERROR_STYLE)
+            return
+
+        expires = (
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(credential.expires_at))
+            if credential.expires_at is not None
+            else "unknown"
+        )
+        self._write_panel(
+            "login",
+            f"OpenAI Codex OAuth saved to {credential.source}.\nExpires: {expires}",
+            STATUS_STYLE,
+        )
 
     def _expand_skill_text(self, text: str) -> str | None:
         command = text.strip().split(maxsplit=1)[0]
@@ -983,6 +1092,7 @@ class WillowApp:
         self._write_line("  /exit, /quit       Exit Willow.")
         self._write_line("  /clear             Reset conversation history.")
         self._write_line("  /help              Show this message.")
+        self._write_line("  /login [openai-codex] Authenticate OpenAI Codex.")
         self._write_line("  /model [name|#]    List or switch models.")
         self._write_line("  /session, /status  Show persistence and session status.")
         self._write_line("  /statusline [on|off] Toggle status snapshots.")
@@ -1260,7 +1370,10 @@ class _LiveTerminal:
         self.streaming = False
         self.worker: threading.Thread | None = None
         self.pending_user_inputs: list[str] = []
+        self.compacting = False
+        self._last_compaction_frame_at = 0.0
         self.prompt_lines = 0
+        self.prompt_width = 0
         self.prompt_cursor_offset_from_bottom = 0
         self.in_text = False
         self.in_thinking = False
@@ -1271,6 +1384,7 @@ class _LiveTerminal:
         self.active_turn_id = 0
         self.model_picker_choices: list[ModelChoice] | None = None
         self.model_picker_selected = 0
+        self.login_picker_selected = 0
         self.input_hint_rows: list[str] | None = None
         self.input_hint_source = ""
         self.input_hint_selected = 0
@@ -1291,6 +1405,13 @@ class _LiveTerminal:
                 while self.running:
                     self._read_available_input()
                     self._drain_events()
+                    should_animate = (
+                        self.compacting
+                        and time.monotonic() - self._last_compaction_frame_at >= 0.12
+                    )
+                    if should_animate:
+                        self._last_compaction_frame_at = time.monotonic()
+                        self._draw_prompt()
                 if not self.streaming and self.worker is None and self.pending_user_inputs:
                     self._start_queued_turn()
             except KeyboardInterrupt:
@@ -1304,10 +1425,10 @@ class _LiveTerminal:
         old = termios.tcgetattr(self.fd)
         try:
             tty.setcbreak(self.fd)
-            self.app._write("\x1b[?2004h")
+            self.app._write("\x1b[?2004h\x1b[6 q")
             yield
         finally:
-            self.app._write("\x1b[?2004l\x1b[0m\x1b[?25h")
+            self.app._write("\x1b[?2004l\x1b[0 q\x1b[0m\x1b[?25h")
             termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
 
     def _read_available_input(self) -> None:
@@ -1424,6 +1545,9 @@ class _LiveTerminal:
     def _model_picker_active(self) -> bool:
         return not self.streaming and self.buffer.strip() == "/model"
 
+    def _login_picker_active(self) -> bool:
+        return not self.streaming and self.buffer.strip() == "/login"
+
     def _ensure_model_picker(self) -> list[ModelChoice] | None:
         if not self._model_picker_active():
             self.model_picker_choices = None
@@ -1452,8 +1576,18 @@ class _LiveTerminal:
             min(len(choices) - 1, self.model_picker_selected + delta),
         )
 
+    def _move_login_picker_selection(self, delta: int) -> None:
+        self.login_picker_selected = max(
+            0,
+            min(len(LOGIN_PROVIDER_CHOICES) - 1, self.login_picker_selected + delta),
+        )
+
     def _input_hints_active(self) -> bool:
-        return not self.streaming and not self._model_picker_active()
+        return (
+            not self.streaming
+            and not self._model_picker_active()
+            and not self._login_picker_active()
+        )
 
     def _ensure_input_hints(self) -> list[str]:
         if not self._input_hints_active():
@@ -1486,6 +1620,8 @@ class _LiveTerminal:
     def _move_picker_selection(self, delta: int) -> None:
         if self._model_picker_active():
             self._move_model_picker_selection(delta)
+        elif self._login_picker_active():
+            self._move_login_picker_selection(delta)
         else:
             self._move_input_hint_selection(delta)
 
@@ -1499,6 +1635,13 @@ class _LiveTerminal:
             self.cursor = len(self.buffer)
             self.model_picker_choices = None
             self.model_picker_selected = 0
+            return True
+
+        if self._login_picker_active():
+            provider, _description = LOGIN_PROVIDER_CHOICES[self.login_picker_selected]
+            self.buffer = f"/login {provider}"
+            self.cursor = len(self.buffer)
+            self.login_picker_selected = 0
             return True
 
         rows = self._ensure_input_hints()
@@ -1519,6 +1662,9 @@ class _LiveTerminal:
     def _submit_buffer(self, *, use_selected_hint: bool = True) -> None:
         if self._model_picker_active():
             self._submit_model_picker_selection()
+            return
+        if self._login_picker_active():
+            self._submit_login_picker_selection()
             return
         if use_selected_hint and self._submit_input_hint_selection():
             return
@@ -1567,8 +1713,8 @@ class _LiveTerminal:
             return False
         selected = rows[self.input_hint_selected]
         text = _apply_hint_to_input(self.buffer, selected)
-        if text.strip() == "/model":
-            self.buffer = "/model"
+        if text.strip() in {"/login", "/model"}:
+            self.buffer = text.strip()
             self.cursor = len(self.buffer)
             self.input_hint_rows = None
             self.input_hint_source = ""
@@ -1601,6 +1747,15 @@ class _LiveTerminal:
             return
         selected = choices[selected_index]
         self.app._apply_model_choice(selected)
+        self._draw_prompt()
+
+    def _submit_login_picker_selection(self) -> None:
+        provider, _description = LOGIN_PROVIDER_CHOICES[self.login_picker_selected]
+        self.buffer = ""
+        self.cursor = 0
+        self.login_picker_selected = 0
+        self._clear_prompt()
+        self.app._handle_login(provider)
         self._draw_prompt()
 
     def _interrupt_with_buffer_if_possible(self) -> None:
@@ -1692,9 +1847,13 @@ class _LiveTerminal:
 
     def _worker_main(self, turn_id: int, provider: Provider) -> None:
         try:
+            request_messages = self.app._messages_for_request(
+                on_compaction_start=lambda: self.events.put((turn_id, "compact_start", None)),
+                on_compaction_end=lambda: self.events.put((turn_id, "compact_end", None)),
+            )
             request = CompletionRequest(
                 model=self.app.current_model,
-                messages=list(self.app.messages),
+                messages=request_messages,
                 max_tokens=self.app.max_tokens,
                 system=self.app.system,
                 tools=self.app.tool_specs,
@@ -1727,6 +1886,14 @@ class _LiveTerminal:
                 self._clear_prompt()
                 self.app._write_panel("error", repr(payload), ERROR_STYLE)
                 self.streaming = False
+                self.compacting = False
+            elif kind == "compact_start":
+                self.compacting = True
+                self._last_compaction_frame_at = 0.0
+                self._draw_prompt()
+            elif kind == "compact_end":
+                self.compacting = False
+                self._draw_prompt()
             if self.running and kind != "stream":
                 self._draw_prompt()
 
@@ -1793,29 +1960,37 @@ class _LiveTerminal:
     def _draw_prompt(self) -> None:
         self._clear_prompt()
         width = self.app._terminal_width()
+        line_width = _terminal_line_width(width)
         status = self.app._status_text()
         preview = _strip_control(self.buffer)
         cursor = min(len(preview), len(_strip_control(self.buffer[: self.cursor])))
         self.app._write("\x1b[?25l")
         prompt_lines = 0
-        if self.streaming:
-            self.app._write(f"{STATUS_STYLE}{' working...'.ljust(width)}{RESET}\n")
+        if self.compacting:
+            frame = COMPACTION_FRAMES[int(time.monotonic() * 8) % len(COMPACTION_FRAMES)]
+            line = f" {frame} Auto-compacting..."
+            self.app._write(
+                f"{_styled_terminal_line(line, COMPACTION_STYLE, width)}\n"
+            )
+            prompt_lines += 1
+        elif self.streaming:
+            self.app._write(f"{_styled_terminal_line(' working...', STATUS_STYLE, width)}\n")
             prompt_lines += 1
         if self.pending_user_inputs:
             title = " Messages to be submitted after next tool call"
             hint = " (press esc to interrupt and send immediately)"
-            self.app._write(f"{STATUS_STYLE}{title[:width].ljust(width)}{RESET}\n")
+            self.app._write(f"{_styled_terminal_line(title, STATUS_STYLE, width)}\n")
             prompt_lines += 1
-            self.app._write(f"{STATUS_STYLE}{hint[:width].ljust(width)}{RESET}\n")
+            self.app._write(f"{_styled_terminal_line(hint, STATUS_STYLE, width)}\n")
             prompt_lines += 1
             for text in self.pending_user_inputs:
                 line = f"  ↳ {_strip_control(text)}"
-                self.app._write(f"{STATUS_STYLE}{line[:width].ljust(width)}{RESET}\n")
+                self.app._write(f"{_styled_terminal_line(line, STATUS_STYLE, width)}\n")
                 prompt_lines += 1
         prefix = " > "
         continuation_prefix = " " * len(prefix)
-        first_input_width = max(1, width - len(prefix))
-        continuation_width = max(1, width - len(continuation_prefix))
+        first_input_width = max(1, line_width - len(prefix))
+        continuation_width = max(1, line_width - len(continuation_prefix))
         if len(preview) <= first_input_width:
             input_lines = [preview]
             line_starts = [0]
@@ -1847,7 +2022,7 @@ class _LiveTerminal:
             if line_index:
                 self.app._write("\n")
             display = f"{prefix}{line}" if line_index == 0 else f"{continuation_prefix}{line}"
-            self.app._write(f"{PROMPT_STYLE}{display.ljust(width)}{RESET}")
+            self.app._write(_styled_terminal_line(display, PROMPT_STYLE, width))
             prompt_lines += 1
         model_picker_choices = self._ensure_model_picker()
         if model_picker_choices is not None:
@@ -1855,11 +2030,20 @@ class _LiveTerminal:
                 model_picker_choices,
                 current_model=self.app.current_model,
                 selected_index=self.model_picker_selected,
-                width=width,
+                width=line_width,
                 styles_enabled=self.app._styles_enabled(),
             )
             for row in rows:
-                self.app._write(f"\n{row}")
+                self.app._write(f"\n\x1b[?7l{row}\x1b[?7h")
+                prompt_lines += 1
+        elif self._login_picker_active():
+            rows = _render_login_picker_rows(
+                selected_index=self.login_picker_selected,
+                width=line_width,
+                styles_enabled=self.app._styles_enabled(),
+            )
+            for row in rows:
+                self.app._write(f"\n\x1b[?7l{row}\x1b[?7h")
                 prompt_lines += 1
         else:
             input_hints = self._ensure_input_hints()
@@ -1867,19 +2051,20 @@ class _LiveTerminal:
                 rows = _render_input_hint_rows(
                     input_hints,
                     selected_index=self.input_hint_selected,
-                    width=width,
+                    width=line_width,
                     styles_enabled=self.app._styles_enabled(),
                 )
                 for row in rows:
-                    self.app._write(f"\n{row}")
+                    self.app._write(f"\n\x1b[?7l{row}\x1b[?7h")
                     prompt_lines += 1
             elif self.app._statusline_enabled:
-                line = f" {status}"[:width].ljust(width)
+                line = f" {status}"[:line_width].ljust(line_width)
                 self.app._write(
-                    f"\n{STATUS_STYLE}{_style_statusline_text(line)}{RESET}"
+                    f"\n\x1b[?7l{STATUS_STYLE}{_style_statusline_text(line)}{RESET}\x1b[?7h"
                 )
                 prompt_lines += 1
         self.prompt_lines = prompt_lines
+        self.prompt_width = line_width
         self.prompt_cursor_offset_from_bottom = prompt_lines - prompt_line_index - 1
         self._place_prompt_cursor(cursor_column)
 
@@ -1894,14 +2079,19 @@ class _LiveTerminal:
     def _clear_prompt(self) -> None:
         if self.prompt_lines == 0:
             return
+        current_width = _terminal_line_width(self.app._terminal_width())
+        previous_width = self.prompt_width or current_width
+        wrap_factor = max(1, (previous_width + current_width - 1) // current_width)
+        rows_to_clear = self.prompt_lines * wrap_factor
         if self.prompt_cursor_offset_from_bottom:
-            self.app._write(f"\x1b[{self.prompt_cursor_offset_from_bottom}B")
+            self.app._write(f"\x1b[{self.prompt_cursor_offset_from_bottom * wrap_factor}B")
             self.prompt_cursor_offset_from_bottom = 0
         self.app._write("\x1b[?25l\r\x1b[2K")
-        for _ in range(self.prompt_lines - 1):
+        for _ in range(rows_to_clear - 1):
             self.app._write("\x1b[1A\r\x1b[2K")
         self.app._write("\x1b[?25h")
         self.prompt_lines = 0
+        self.prompt_width = 0
 
 
 def _state_from_session(record: SessionRecord) -> dict[str, object]:
