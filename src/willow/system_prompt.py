@@ -91,13 +91,17 @@ def _guidelines(
     names = set(tools_by_name)
     guidelines: list[str] = []
 
-    if "bash" in names and "grep" in names:
+    if "bash" in names:
         guidelines.append(
-            "Use grep for content searches before broad shell searches; use bash "
-            "for general shell commands."
+            "When searching for text or files, prefer using `rg` or `rg --files` "
+            "respectively because rg is much faster than alternatives like grep. "
+            "If the rg command is not found, use alternatives."
         )
-    elif "bash" in names:
-        guidelines.append("Use bash for file operations like ls, rg, find")
+        guidelines.append(
+            "For bash commands, keep tty=false for normal scripts, tests, installs, "
+            "and service launches. Use tty=true only for commands that require an "
+            "interactive terminal, such as shells, REPLs, prompts, or full-screen tools."
+        )
 
     if "read" in names and "edit" in names:
         guidelines.append("Use read to examine files before editing.")
@@ -106,6 +110,30 @@ def _guidelines(
     if "write" in names:
         guidelines.append("Use write only for new files or complete rewrites")
     if "edit" in names or "write" in names:
+        guidelines.append(
+            "When fixing existing code, prefer minimal behavioral changes and "
+            "preserve existing external contracts such as paths, filenames, "
+            "commands, schemas, env vars, ports, permissions, and output "
+            "locations unless the user explicitly asks to change them."
+        )
+        guidelines.append(
+            "For framework services, prefer conventional entrypoint names and "
+            "process shapes unless the user specifies otherwise."
+        )
+        guidelines.append(
+            "Before starting a long-running, expensive, or quiet operation, "
+            "briefly tell the user what you are about to do and why, then issue "
+            "the tool call. Examples include installing packages, downloading "
+            "models or datasets, building containers, running test suites, and "
+            "starting services."
+        )
+        guidelines.append(
+            "When starting background shell work that may need monitoring, make "
+            "sure stdout/stderr is available in a known log file, then explicitly "
+            "call monitor with a shell command such as `tail -F /tmp/task.log | "
+            "grep --line-buffered PATTERN`. Willow does not automatically start "
+            "monitors after background commands."
+        )
         guidelines.append(
             "When summarizing your actions, output plain text directly; do not use "
             "bash to display what you did."

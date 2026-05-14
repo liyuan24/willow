@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
+from .message_history import monitor_event_text_blocks
 from .permissions import PermissionGate
 from .providers.base import (
-    CompletionRequest,
     CompletionResponse,
     ContentBlock,
     Message,
@@ -29,6 +29,7 @@ from .providers.base import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from .request_preparation import RequestPreparer, complete_with_recovery, stream_with_recovery
 from .tools.base import Tool
 
 
@@ -41,6 +42,7 @@ def run(
     max_tokens: int = 4096,
     max_iterations: int = 20,
     permission_gate: PermissionGate | None = None,
+    context_window: int | None = None,
 ) -> CompletionResponse:
     """Run the agent loop until the model stops or `max_iterations` is hit.
 
@@ -58,39 +60,45 @@ def run(
     so the model can react to the failure on the next turn.
     """
     tool_specs = [t.spec() for t in tools_by_name.values()]
+    runtime = _runtime_from_tools(tools_by_name)
     messages: list[Message] = [
         Message(role="user", content=[TextBlock(text=user_input)])
     ]
+    preparer = RequestPreparer(
+        provider=provider,
+        model=model,
+        system=system,
+        tools=tool_specs,
+        max_tokens=max_tokens,
+        context_window=context_window,
+    )
 
     response: CompletionResponse | None = None
     for _ in range(max_iterations):
-        # Snapshot the message list so providers see an immutable view of the
-        # turn they were called on — the loop mutates `messages` between calls.
-        request = CompletionRequest(
-            model=model,
-            messages=list(messages),
-            max_tokens=max_tokens,
-            system=system,
-            tools=tool_specs,
-        )
-        response = provider.complete(request)
+        response = complete_with_recovery(preparer, messages)
         messages.append(Message(role="assistant", content=list(response.content)))
 
         if response.stop_reason != "tool_use":
-            return response
+            monitor_blocks = _drain_monitor_event_blocks(runtime)
+            if not monitor_blocks:
+                return response
+            messages.append(Message(role="user", content=monitor_blocks))
+            continue
 
         tool_results: list[ContentBlock] = []
         for block in response.content:
             if not isinstance(block, ToolUseBlock):
                 continue
             tool_results.append(dispatch_tool(block, tools_by_name, permission_gate))
+        monitor_blocks = _drain_monitor_event_blocks(runtime)
 
         # An assistant turn with stop_reason="tool_use" but no ToolUseBlocks
         # would be a provider bug; bail rather than spin.
-        if not tool_results:
+        followup_blocks = [*tool_results, *monitor_blocks]
+        if not followup_blocks:
             return response
 
-        messages.append(Message(role="user", content=tool_results))
+        messages.append(Message(role="user", content=followup_blocks))
 
     # Hit max_iterations. `response` is non-None because the loop ran at least once.
     assert response is not None
@@ -107,6 +115,7 @@ def run_streaming(
     max_iterations: int = 20,
     on_event: Callable[[StreamEvent], None] = lambda _e: None,
     permission_gate: PermissionGate | None = None,
+    context_window: int | None = None,
 ) -> CompletionResponse:
     """Run the agent loop using streaming for each model turn.
 
@@ -126,22 +135,23 @@ def run_streaming(
     propagate (the loop does not catch them).
     """
     tool_specs = [t.spec() for t in tools_by_name.values()]
+    runtime = _runtime_from_tools(tools_by_name)
     messages: list[Message] = [
         Message(role="user", content=[TextBlock(text=user_input)])
     ]
+    preparer = RequestPreparer(
+        provider=provider,
+        model=model,
+        system=system,
+        tools=tool_specs,
+        max_tokens=max_tokens,
+        context_window=context_window,
+    )
 
     response: CompletionResponse | None = None
     for _ in range(max_iterations):
-        request = CompletionRequest(
-            model=model,
-            messages=list(messages),
-            max_tokens=max_tokens,
-            system=system,
-            tools=tool_specs,
-        )
-
         response = None
-        for event in provider.stream(request):
+        for event in stream_with_recovery(preparer, messages):
             on_event(event)
             if isinstance(event, StreamComplete):
                 response = event.response
@@ -153,18 +163,24 @@ def run_streaming(
         messages.append(Message(role="assistant", content=list(response.content)))
 
         if response.stop_reason != "tool_use":
-            return response
+            monitor_blocks = _drain_monitor_event_blocks(runtime)
+            if not monitor_blocks:
+                return response
+            messages.append(Message(role="user", content=monitor_blocks))
+            continue
 
         tool_results: list[ContentBlock] = []
         for block in response.content:
             if not isinstance(block, ToolUseBlock):
                 continue
             tool_results.append(dispatch_tool(block, tools_by_name, permission_gate))
+        monitor_blocks = _drain_monitor_event_blocks(runtime)
 
-        if not tool_results:
+        followup_blocks = [*tool_results, *monitor_blocks]
+        if not followup_blocks:
             return response
 
-        messages.append(Message(role="user", content=tool_results))
+        messages.append(Message(role="user", content=followup_blocks))
 
     assert response is not None
     return response
@@ -200,3 +216,23 @@ def dispatch_tool(
             is_error=True,
         )
     return ToolResultBlock(tool_use_id=block.id, content=output)
+
+
+def _runtime_from_tools(tools_by_name: Mapping[str, Tool]) -> object | None:
+    for tool in tools_by_name.values():
+        runtime = getattr(tool, "runtime", None)
+        if runtime is not None and hasattr(runtime, "events"):
+            return runtime
+    return None
+
+
+def _drain_monitor_event_blocks(runtime: object | None) -> list[ContentBlock]:
+    if runtime is None:
+        return []
+    events = getattr(runtime, "events", None)
+    if events is None or not hasattr(events, "drain"):
+        return []
+    drained = events.drain()
+    if not drained:
+        return []
+    return list(monitor_event_text_blocks(drained))

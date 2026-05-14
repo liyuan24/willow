@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from .base import Tool
+from .utils.output import externalize_large_output
 
 
 class ReadTool(Tool):
@@ -36,4 +37,5 @@ class ReadTool(Tool):
         selected = lines[start:end]
         if not selected:
             return "[empty]"
-        return "\n".join(f"{start + i + 1:6d}\t{line}" for i, line in enumerate(selected))
+        output = "\n".join(f"{start + i + 1:6d}\t{line}" for i, line in enumerate(selected))
+        return externalize_large_output(output, tool_name=self.name)

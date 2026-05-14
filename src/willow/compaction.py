@@ -53,14 +53,9 @@ def maybe_compact_messages(
     state: RuntimeCompaction | None,
     on_start: Callable[[], None] | None = None,
     on_end: Callable[[], None] | None = None,
+    force: bool = False,
 ) -> tuple[list[Message], RuntimeCompaction | None]:
     """Return request messages, compacting in memory if needed."""
-
-    if len(messages) <= FIRST_MESSAGES_TO_KEEP + LAST_MESSAGES_TO_KEEP:
-        return list(messages), None
-
-    first_end = _first_keep_end(messages, FIRST_MESSAGES_TO_KEEP)
-    last_start = _last_keep_start(messages, first_end, LAST_MESSAGES_TO_KEEP)
 
     should_start = state is None and _should_start_compaction(
         system=system,
@@ -69,7 +64,23 @@ def maybe_compact_messages(
         max_tokens=max_tokens,
         context_window=context_window,
     )
-    should_update = state is not None and state.summarized_until < last_start
+    should_start = should_start or (force and state is None)
+    if (
+        not force
+        and not should_start
+        and state is None
+        and len(messages) <= FIRST_MESSAGES_TO_KEEP + LAST_MESSAGES_TO_KEEP
+    ):
+        return list(messages), None
+
+    first_end, last_start = _compaction_bounds(messages, force=force)
+    if last_start <= first_end and should_start:
+        first_end, last_start = _compaction_bounds(messages, force=True)
+    if last_start <= first_end:
+        if state is None:
+            return list(messages), None
+        return _build_compacted_messages(messages, first_end, last_start, state.summary), state
+    should_update = state is not None and (force or state.summarized_until < last_start)
 
     if not should_start and not should_update:
         if state is None:
@@ -80,7 +91,7 @@ def maybe_compact_messages(
         on_start()
     try:
         provider.reset_conversation()
-        if state is None:
+        if state is None or force:
             summary = _summarize_messages(
                 provider=provider,
                 model=model,
@@ -105,6 +116,27 @@ def maybe_compact_messages(
 
 def compacted_message_count() -> int:
     return FIRST_MESSAGES_TO_KEEP + 1 + LAST_MESSAGES_TO_KEEP
+
+
+def _compaction_bounds(messages: list[Message], *, force: bool) -> tuple[int, int]:
+    if not force:
+        first_end = _first_keep_end(messages, FIRST_MESSAGES_TO_KEEP)
+        last_start = _last_keep_start(messages, first_end, LAST_MESSAGES_TO_KEEP)
+        return first_end, last_start
+
+    if len(messages) <= 1:
+        return len(messages), len(messages)
+    if len(messages) <= 3:
+        return 1, len(messages)
+
+    first_end = _first_keep_end(messages, min(2, len(messages)))
+    # Recovery compaction should shrink much more aggressively than the
+    # proactive path while still preserving the freshest tool/result pair.
+    last_keep = min(8, max(1, len(messages) - first_end - 1))
+    last_start = _last_keep_start(messages, first_end, last_keep)
+    if last_start <= first_end and first_end < len(messages) - 1:
+        last_start = first_end + 1
+    return first_end, last_start
 
 
 def _should_start_compaction(

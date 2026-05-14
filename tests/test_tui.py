@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -29,6 +30,12 @@ from willow.providers import (
 )
 from willow.tools import TOOLS_BY_NAME
 from willow.tools.base import Tool
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
 
 class _ScriptedStreamProvider(Provider):
@@ -72,9 +79,33 @@ class _RecordingTool(Tool):
         return f"echoed: {kwargs.get('message', '')}"
 
 
+class _PromptObservingTool(Tool):
+    name = "observe_prompt"
+    description = "Record the terminal while the tool is running."
+    input_schema = {"type": "object", "properties": {}}
+
+    def __init__(self, out: io.StringIO) -> None:
+        self.out = out
+        self.observed = ""
+
+    def run(self, **_kwargs: Any) -> str:
+        self.observed = self.out.getvalue()
+        return "observed"
+
+
 class _TTYBuffer(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class _FlushingTTYBuffer(_TTYBuffer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
 
 
 def _make_args(**overrides: Any) -> argparse.Namespace:
@@ -87,6 +118,26 @@ def _make_args(**overrides: Any) -> argparse.Namespace:
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+def _assert_interrupted_retry_content(
+    content: list[Any],
+    *,
+    interrupted: str,
+    interrupting: str,
+) -> None:
+    assert len(content) == 1
+    block = content[0]
+    assert isinstance(block, TextBlock)
+    assert "Answer each active user message below now, in order." in block.text
+    assert (
+        f"[active user message 1 of 2; interrupted before completion]\n{interrupted}"
+        in block.text
+    )
+    assert (
+        f"[active user message 2 of 2; new message after interruption]\n{interrupting}"
+        in block.text
+    )
 
 
 def _drive(
@@ -107,6 +158,17 @@ def _drive(
     app = tui.WillowApp(args, provider, input_func=input_func, out=out)
     assert app.run() == 0
     return out.getvalue(), app
+
+
+def test_live_terminal_prefills_initial_prompt() -> None:
+    provider = _ScriptedStreamProvider([])
+    args = _make_args(initial_prompt="run this task")
+    app = tui.WillowApp(args, provider, input_func=input, out=io.StringIO())
+
+    terminal = tui._LiveTerminal(app)
+
+    assert terminal.buffer == "run this task"
+    assert terminal.cursor == len("run this task")
 
 
 def _session_record(
@@ -552,7 +614,7 @@ def test_render_statusline_includes_context_usage_and_total_tokens() -> None:
 
     assert (
         rendered
-        == "gpt-5.5 | Context 1.0% used (10.5k tok / 1.1M tok) | "
+        == "gpt-5.5 | Context 1.0% used (10.5k tok) | window: 1.1M tok | "
         "input: 40.0k tok | cached total: 12.0k tok | output: 2.0k tok | cwd: ~/repos/willow"
     )
 
@@ -568,18 +630,21 @@ def test_render_statusline_shows_zero_before_provider_usage() -> None:
         cwd="~/repos/willow",
     )
 
-    assert rendered == "gpt-5.5 | Context 0.0% used (0 tok / 1.1M tok) | cwd: ~/repos/willow"
+    assert (
+        rendered
+        == "gpt-5.5 | Context 0.0% used (0 tok) | window: 1.1M tok | cwd: ~/repos/willow"
+    )
 
 
 def test_styled_statusline_colors_model_and_context_usage() -> None:
     rendered = tui._style_statusline_text(
-        "gpt-5.5 | Context 0.0% used (3 tok / 1.1M tok) | "
+        "gpt-5.5 | Context 0.0% used (3 tok) | window: 1.1M tok | "
         "input: 1 tok | cached total: 0 tok | output: 2 tok | cwd: ~/repos/willow"
     )
 
     assert f"{tui.STATUS_MODEL_STYLE}gpt-5.5{tui.STATUS_STYLE}" in rendered
     assert (
-        f"{tui.STATUS_TOKEN_STYLE}Context 0.0% used (3 tok / 1.1M tok) | "
+        f"{tui.STATUS_TOKEN_STYLE}Context 0.0% used (3 tok) | window: 1.1M tok | "
         f"input: 1 tok | cached total: 0 tok | output: 2 tok"
         f"{tui.STATUS_STYLE}"
     ) in rendered
@@ -598,7 +663,7 @@ def test_status_text_uses_last_provider_input_tokens_not_heuristic() -> None:
 
     rendered = app._status_text()
 
-    assert "Context 0.1% used (862 tok / 1.1M tok)" in rendered
+    assert "Context 0.1% used (862 tok) | window: 1.1M tok" in rendered
     assert "input: 900.0k tok" in rendered
     assert "cached total: 300.0k tok" in rendered
     assert "output: 100.0k tok" in rendered
@@ -666,6 +731,42 @@ def test_styled_transcript_wraps_long_lines_without_dropping_text() -> None:
     assert "z           " in rendered
 
 
+def test_running_terminal_line_animates_without_changing_text() -> None:
+    first = tui._running_terminal_line(" running bash - pytest", 28, frame=0)
+    second = tui._running_terminal_line(" running bash - pytest", 28, frame=6)
+    bright = tui._running_terminal_line(" running bash - pytest", 28, frame=4)
+
+    assert first != second
+    assert "\x1b[40;" in first
+    assert "\x1b[40;38;5;51;1m" in bright
+    assert "\x1b[40;38;5;242m" in first
+    assert "\x1b[48;5;238" not in first
+    assert _strip_ansi(first) == " running bash - pytest".ljust(28)
+    assert _strip_ansi(second) == " running bash - pytest".ljust(28)
+
+
+def test_tool_running_title_collapses_multiline_bash_command() -> None:
+    block = ToolUseBlock(
+        id="call_1",
+        name="bash",
+        input={
+            "command": (
+                "python - <<'PY'\n"
+                "from pathlib import Path\n"
+                "from transformers import AutoTokenizer\n"
+                "print('ready')\n"
+                "PY"
+            )
+        },
+    )
+
+    title = tui._tool_running_title(block)
+
+    assert title.startswith("running bash - python - <<'PY' from pathlib import Path")
+    assert "\n" not in title
+    assert "\r" not in title
+
+
 def test_live_prompt_box_shows_working_when_streaming_without_input() -> None:
     out = _TTYBuffer()
     app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
@@ -680,10 +781,49 @@ def test_live_prompt_box_shows_working_when_streaming_without_input() -> None:
     assert tui.PROMPT_STYLE in rendered
     assert "working..." in rendered
     assert " > " in rendered
+    assert live.prompt_lines == 5
+    assert live.prompt_cursor_offset_from_bottom == 2
     assert "\r\x1b[3C\x1b[?25h" in rendered
     assert rendered.index("working...") < rendered.index(tui.PROMPT_STYLE)
     assert "streaming" not in rendered
     assert "ready" not in rendered
+
+
+def test_live_active_tool_status_has_gap_before_input_box() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+    live.active_tool_status = "running bash - pytest"
+
+    live._draw_prompt()
+
+    rendered = _strip_ansi(out.getvalue())
+    assert "running bash - pytest" in rendered
+    assert "running bash - pytest" in rendered[: rendered.index(" > ")]
+    assert live.prompt_lines == 6
+    assert live.prompt_cursor_offset_from_bottom == 2
+
+
+def test_live_running_status_redraw_does_not_repaint_input_box() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+    live.active_tool_status = "running bash - pytest"
+
+    live._draw_prompt()
+    out.seek(0)
+    out.truncate(0)
+    live._redraw_running_status_line()
+
+    rendered = out.getvalue()
+    assert "running bash - pytest" in _strip_ansi(rendered)
+    assert " > " not in rendered
+    assert tui.PROMPT_STYLE not in rendered
+    assert "\x1b[2K" not in rendered
 
 
 def test_live_prompt_box_switches_to_type_box_when_streaming_with_input() -> None:
@@ -738,8 +878,26 @@ def test_live_prompt_wraps_long_input_across_lines() -> None:
     assert "\n" in rendered
     assert "   hijkl" in rendered
     assert " > hijkl" not in rendered
-    assert live.prompt_lines == 2
+    assert live.prompt_lines == 4
     assert "\x1b[8C\x1b[?25h" in rendered
+
+
+def test_live_prompt_collapses_pasted_content_placeholder() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    app._statusline_enabled = False
+    live = tui._LiveTerminal(app)
+    pasted = "Instruction\n" + ("Set up service.\n" * 20)
+
+    live._insert_pasted_text(pasted)
+    live._draw_prompt()
+
+    rendered = out.getvalue()
+    assert f"[Pasted Content {len(pasted)} chars]" in rendered
+    assert "Set up service." not in rendered
+    assert live.buffer == pasted
+    assert live.cursor == len(pasted)
 
 
 def test_live_prompt_clear_accounts_for_terminal_zoom_in() -> None:
@@ -759,6 +917,24 @@ def test_live_prompt_clear_accounts_for_terminal_zoom_in() -> None:
     rendered = out.getvalue()
     assert rendered.count("\x1b[1A\r\x1b[2K") >= 3
     assert live.prompt_width == 10
+
+
+def test_live_prompt_redraw_flushes_one_frame() -> None:
+    out = _FlushingTTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+
+    live._draw_prompt()
+    out.flush_count = 0
+    live.buffer = "a"
+    live.cursor = len(live.buffer)
+    live._draw_prompt()
+
+    assert out.flush_count == 1
+    rendered = out.getvalue()
+    assert "\x1b[2K" in rendered
+    assert " > a" in rendered
 
 
 def test_welcome_card_keeps_compact_width() -> None:
@@ -1202,6 +1378,71 @@ def test_live_prompt_shows_queued_messages_with_interrupt_hint() -> None:
     assert "↳ second" in rendered
 
 
+def test_live_prompt_hides_pending_monitor_events() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+    live.pending_monitor_inputs = ["Monitor event: service ready"]
+
+    live._draw_prompt()
+
+    rendered = out.getvalue()
+    assert "Monitor event:" not in rendered
+    assert "service ready" not in rendered
+    assert "Messages to be submitted after next tool call" not in rendered
+
+
+def test_live_queue_monitor_event_uses_hidden_queue() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+
+    live._queue_monitor_event(
+        {
+            "event_type": "command_output",
+            "severity": "info",
+            "summary": "service ready",
+        }
+    )
+
+    assert live.pending_user_inputs == []
+    assert live.pending_monitor_inputs == [
+        "Monitor event: service ready"
+    ]
+    assert "Monitor event:" not in out.getvalue()
+
+
+def test_live_finish_response_sends_monitor_events_without_rendering_them() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+    live.pending_monitor_inputs = ["Monitor event: service ready"]
+    started: list[bool] = []
+
+    def fake_start_worker() -> None:
+        started.append(True)
+
+    live._start_worker = fake_start_worker  # type: ignore[method-assign]
+
+    live._finish_response(
+        CompletionResponse(content=[TextBlock(text="ack")], stop_reason="end_turn")
+    )
+
+    rendered = out.getvalue()
+    assert started
+    assert "Monitor event:" not in rendered
+    assert "service ready" not in rendered
+    assert [message.role for message in app.messages] == ["assistant", "user"]
+    assert app.messages[1].content == [TextBlock(text="Monitor event: service ready")]
+    assert live.pending_monitor_inputs == []
+
+
 def test_live_submit_while_streaming_writes_queued_status_panel() -> None:
     out = _TTYBuffer()
     app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
@@ -1245,10 +1486,11 @@ def test_live_esc_interrupt_keeps_user_and_queued_messages_without_partial_assis
 
     assert started
     assert [message.role for message in app.messages] == ["user"]
-    assert app.messages[0].content == [
-        TextBlock(text="[interrupted user message 1 of 2]\nrefactor the TUI"),
-        TextBlock(text="[interrupting user message 2 of 2]\nqueued followup"),
-    ]
+    _assert_interrupted_retry_content(
+        app.messages[0].content,
+        interrupted="refactor the TUI",
+        interrupting="queued followup",
+    )
     assert live.stream_text == []
     rendered = out.getvalue()
     assert "Interrupted current turn; sending queued input now." in rendered
@@ -1275,10 +1517,11 @@ def test_live_esc_interrupt_sends_queued_message_to_provider_request() -> None:
     assert len(provider.requests) == 1
     request = provider.requests[0]
     assert [message.role for message in request.messages] == ["user"]
-    assert request.messages[0].content == [
-        TextBlock(text="[interrupted user message 1 of 2]\nrefactor the TUI"),
-        TextBlock(text="[interrupting user message 2 of 2]\nsurprise me"),
-    ]
+    _assert_interrupted_retry_content(
+        request.messages[0].content,
+        interrupted="refactor the TUI",
+        interrupting="surprise me",
+    )
 
 
 def test_live_esc_interrupt_replaces_provider_before_sending_queued_message(
@@ -1310,10 +1553,11 @@ def test_live_esc_interrupt_replaces_provider_before_sending_queued_message(
     assert [message.role for message in request.messages] == ["user", "assistant", "user"]
     assert request.messages[0].content == [TextBlock(text="previous")]
     assert request.messages[1].content == [TextBlock(text="previous answer")]
-    assert request.messages[2].content == [
-        TextBlock(text="[interrupted user message 1 of 2]\nrefactor the TUI"),
-        TextBlock(text="[interrupting user message 2 of 2]\nsteer now"),
-    ]
+    _assert_interrupted_retry_content(
+        request.messages[2].content,
+        interrupted="refactor the TUI",
+        interrupting="steer now",
+    )
 
 
 def test_live_esc_interrupt_sends_current_buffer_to_provider_request() -> None:
@@ -1337,10 +1581,47 @@ def test_live_esc_interrupt_sends_current_buffer_to_provider_request() -> None:
     assert len(provider.requests) == 1
     request = provider.requests[0]
     assert [message.role for message in request.messages] == ["user"]
-    assert request.messages[0].content == [
-        TextBlock(text="[interrupted user message 1 of 2]\nrefactor the TUI"),
-        TextBlock(text="[interrupting user message 2 of 2]\nsurprise me"),
-    ]
+    _assert_interrupted_retry_content(
+        request.messages[0].content,
+        interrupted="refactor the TUI",
+        interrupting="surprise me",
+    )
+
+
+def test_live_esc_without_buffer_defers_interrupted_message_until_next_submit() -> None:
+    out = _TTYBuffer()
+    response = CompletionResponse(content=[TextBlock(text="done")], stop_reason="end_turn")
+    provider = _ScriptedStreamProvider([[StreamComplete(response=response)]])
+    app = tui.WillowApp(_make_args(), provider, out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+    live.stream_text = ["partial assistant text"]
+    app.messages.append(Message(role="user", content=[TextBlock(text="first message")]))
+    live._reset_provider_for_interrupt = lambda: None  # type: ignore[method-assign]
+
+    live._interrupt_with_buffer_if_possible()
+
+    assert live.streaming is False
+    assert app.messages == []
+    assert live.interrupted_user_inputs == ["first message"]
+    assert live.stream_text == []
+    assert "partial assistant text" not in out.getvalue()
+
+    live.buffer = "second message"
+    live.cursor = len(live.buffer)
+    live._submit_buffer()
+    assert live.worker is not None
+    live.worker.join(timeout=1)
+
+    assert len(provider.requests) == 1
+    request = provider.requests[0]
+    assert [message.role for message in request.messages] == ["user"]
+    _assert_interrupted_retry_content(
+        request.messages[0].content,
+        interrupted="first message",
+        interrupting="second message",
+    )
 
 
 def test_live_left_arrow_moves_cursor_for_mid_buffer_edit() -> None:
@@ -1359,6 +1640,28 @@ def test_live_left_arrow_moves_cursor_for_mid_buffer_edit() -> None:
 
     assert live.buffer == "aXbc"
     assert live.cursor == 2
+
+
+def test_live_bracketed_paste_split_across_reads_preserves_newlines() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    read_fd, write_fd = os.pipe()
+    try:
+        live.fd = read_fd
+        os.write(write_fd, b"\x1b[200~line one\nline")
+        live._read_available_input()
+        os.write(write_fd, b" two\n\x1b[201~")
+        live._read_available_input()
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert live.buffer == "line one\nline two\n"
+    assert live.cursor == len(live.buffer)
+    assert live.pasted_ranges == [(0, len(live.buffer))]
+    assert app.messages == []
 
 
 def test_live_option_arrow_moves_cursor_by_word_for_mid_buffer_edit() -> None:
@@ -1559,6 +1862,30 @@ def test_terminal_bash_tool_renders_command_and_concise_output() -> None:
     assert "  4" in out
     assert "... +1 lines" in out
     assert "\n  5\n" not in out
+
+
+def test_live_tool_execution_keeps_working_prompt_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = _TTYBuffer()
+    tool = _PromptObservingTool(out)
+    monkeypatch.setitem(TOOLS_BY_NAME, tool.name, tool)
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.streaming = True
+    response = CompletionResponse(
+        content=[ToolUseBlock(id="call_1", name=tool.name, input={})],
+        stop_reason="tool_use",
+    )
+
+    live._finish_response(response)
+
+    observed = _strip_ansi(tool.observed)
+    assert "running observe_prompt" in observed
+    assert " > " in observed
+    assert live.active_tool_status is None
+    assert "observe_prompt ok" in out.getvalue()
 
 
 def test_terminal_skill_command_expands_user_message(

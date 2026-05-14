@@ -171,6 +171,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run one prompt headlessly and print the final response.",
     )
     parser.add_argument(
+        "--initial-prompt",
+        default=None,
+        help="Initial prompt to prefill when opening the interactive TUI.",
+    )
+    parser.add_argument(
         "--provider",
         choices=sorted(_PROVIDER_DISPATCH),
         default="openai_codex",

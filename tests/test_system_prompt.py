@@ -25,7 +25,11 @@ def test_build_system_prompt_uses_willow_default_without_pi_docs(tmp_path: Path)
     assert "Pi documentation" not in prompt
     assert "- read:" in prompt
     assert "- bash:" in prompt
-    assert "Use grep for content searches" in prompt
+    assert "prefer using `rg` or `rg --files`" in prompt
+    assert "Use tty=true only for commands that require an interactive terminal" in prompt
+    assert "prefer conventional entrypoint names and process shapes" in prompt
+    assert "Before starting a long-running, expensive, or quiet operation" in prompt
+    assert "Willow does not automatically start monitors after background commands" in prompt
     assert "Current date: 2026-05-10" in prompt
     assert f"Current working directory: {tmp_path.resolve()}" in prompt
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import queue
 import select
@@ -23,14 +22,19 @@ import time
 import tty
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO, cast
 
 from willow.auth import login_openai_codex
-from willow.compaction import RuntimeCompaction, maybe_compact_messages
+from willow.compaction import RuntimeCompaction
 from willow.loop import dispatch_tool
-from willow.message_history import interrupted_user_text_blocks, queued_user_text_blocks
+from willow.message_history import (
+    interrupted_user_text_blocks,
+    monitor_event_text_blocks,
+    monitor_event_texts,
+    queued_user_text_blocks,
+)
 from willow.models import (
     ModelChoice,
     available_model_choices,
@@ -44,7 +48,6 @@ from willow.permissions import (
     tool_permission_summary,
 )
 from willow.providers import (
-    CompletionRequest,
     CompletionResponse,
     Message,
     Provider,
@@ -56,6 +59,11 @@ from willow.providers import (
     ToolResultBlock,
     ToolUseBlock,
     ToolUseDelta,
+)
+from willow.request_preparation import (
+    RequestPreparer,
+    context_window_for_model,
+    stream_with_recovery,
 )
 from willow.session import (
     SessionEntry,
@@ -74,7 +82,8 @@ from willow.skills import (
     render_skill_suggestions,
 )
 from willow.system_prompt import build_system_prompt
-from willow.tools import TOOLS_BY_NAME
+from willow.tools import DEFAULT_RUNTIME, TOOLS_BY_NAME
+from willow.tools.base import Tool
 from willow.turns import append_turn_step, build_turn_step
 
 with contextlib.suppress(ImportError):
@@ -95,18 +104,7 @@ BUILTIN_SLASH_COMMANDS = frozenset(command for command, _description in SLASH_CO
 LOGIN_PROVIDER_CHOICES: tuple[tuple[str, str], ...] = (
     ("openai-codex", "ChatGPT Plus/Pro Codex OAuth"),
 )
-
-MODEL_CONTEXT_TOKENS: dict[str, int] = {
-    "gpt-5.5": 1_050_000,
-    "gpt-5.4": 1_050_000,
-    "gpt-5.4-mini": 400_000,
-    "gpt-5.3-codex": 400_000,
-    "gpt-5.3-codex-spark": 400_000,
-    "gpt-5.2": 400_000,
-    "claude-sonnet-4-6": 200_000,
-    "claude-opus-4-6": 200_000,
-    "claude-haiku-4-6": 200_000,
-}
+PASTE_PLACEHOLDER_MIN_CHARS = 200
 
 RESET = "\x1b[0m"
 DIM = "\x1b[2m"
@@ -151,6 +149,11 @@ def _abbreviate(content: str, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "..."
 
 
+def _one_line(content: object, limit: int = 160) -> str:
+    flat = " ".join(str(content).split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
 def _compact_lines(content: str, *, max_lines: int = 4, max_width: int = 110) -> list[str]:
     lines = [line.rstrip() for line in content.splitlines()]
     if not lines:
@@ -180,17 +183,19 @@ def _tool_action_title(block: ToolUseBlock, *, is_error: bool = False) -> str:
         if offset is not None:
             return f"read ok - {path} from line {offset}"
         return f"read ok - {path}"
-    if block.name == "grep":
-        pattern = _tool_arg(block, "pattern", "<missing pattern>")
-        path = _tool_arg(block, "path", ".")
-        glob = block.input.get("glob")
-        scope = f"{path} ({glob})" if glob else path
-        return f"grep ok - {scope} for {pattern}"
     if block.name == "write":
         return f"write ok - {_tool_arg(block, 'path', '<missing path>')}"
     if block.name == "edit":
         return f"edit ok - {_tool_arg(block, 'path', '<missing path>')}"
     return f"{block.name} ok"
+
+
+def _tool_running_title(block: ToolUseBlock) -> str:
+    if block.name == "bash":
+        return f"running bash - {_tool_arg(block, 'command', '<missing command>')}"
+    if block.name in {"read", "write", "edit"}:
+        return f"running {block.name} - {_tool_arg(block, 'path', '<missing path>')}"
+    return f"running {block.name}"
 
 
 def _tool_edit_title(block: ToolUseBlock, *, path: str, added: int, deleted: int) -> str:
@@ -205,8 +210,7 @@ def _tool_edit_title(block: ToolUseBlock, *, path: str, added: int, deleted: int
 
 def _tool_arg(block: ToolUseBlock, name: str, default: str) -> str:
     value = block.input.get(name, default)
-    text = str(value)
-    return text if len(text) <= 160 else text[:157] + "..."
+    return _one_line(value)
 
 
 def _diff_counts(diff_lines: list[str]) -> tuple[int, int]:
@@ -291,50 +295,6 @@ def _format_tokens(tokens: int) -> str:
     return f"{tokens} tok"
 
 
-def _estimate_text_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return max(1, (len(text) + 3) // 4)
-
-
-def _estimate_content_block_tokens(block: object) -> int:
-    if isinstance(block, TextBlock):
-        return _estimate_text_tokens(block.text)
-    if isinstance(block, ToolResultBlock):
-        return _estimate_text_tokens(block.tool_use_id) + _estimate_text_tokens(block.content)
-    if isinstance(block, ToolUseBlock):
-        return (
-            _estimate_text_tokens(block.id)
-            + _estimate_text_tokens(block.name)
-            + _estimate_text_tokens(json.dumps(block.input, sort_keys=True, default=str))
-        )
-    if isinstance(block, ThinkingBlock):
-        return (
-            _estimate_text_tokens(block.thinking)
-            + _estimate_text_tokens(block.signature or "")
-            + _estimate_text_tokens(block.encrypted_content or "")
-        )
-    data = getattr(block, "data", None)
-    if isinstance(data, str):
-        return _estimate_text_tokens(data)
-    return _estimate_text_tokens(str(block))
-
-
-def _estimate_request_context_tokens(
-    *,
-    system: str | None,
-    messages: list[Message],
-    tools: list[dict[str, object]],
-) -> int:
-    total = _estimate_text_tokens(system or "")
-    for message in messages:
-        total += 4 + _estimate_text_tokens(message.role)
-        total += sum(_estimate_content_block_tokens(block) for block in message.content)
-    for tool in tools:
-        total += _estimate_text_tokens(json.dumps(tool, sort_keys=True, default=str))
-    return total
-
-
 def _render_statusline(
     *,
     model: str,
@@ -349,12 +309,12 @@ def _render_statusline(
     if context_tokens is None:
         context_tokens = 0
     if context_window is None:
-        usage = f"{prefix} unknown ({_format_tokens(context_tokens)})"
+        usage = f"{prefix} unknown ({_format_tokens(context_tokens)}) | window: unknown"
     else:
         percent = (context_tokens / context_window) * 100 if context_window else 0
         usage = (
-            f"{prefix} {percent:.1f}% used "
-            f"({_format_tokens(context_tokens)} / {_format_tokens(context_window)})"
+            f"{prefix} {percent:.1f}% used ({_format_tokens(context_tokens)}) | "
+            f"window: {_format_tokens(context_window)}"
         )
     if input_tokens > 0 or output_tokens > 0:
         usage = (
@@ -399,13 +359,7 @@ def _style_statusline_text(text: str) -> str:
 
 
 def _context_window_for_model(model: str) -> int | None:
-    if model in MODEL_CONTEXT_TOKENS:
-        return MODEL_CONTEXT_TOKENS[model]
-    if model.startswith("gpt-"):
-        return 400_000
-    if model.startswith("claude-"):
-        return 200_000
-    return None
+    return context_window_for_model(model)
 
 
 def _render_command_hints(value: str) -> str:
@@ -525,6 +479,78 @@ def _strip_control(text: str) -> str:
     return text.replace("\r", "\\r").replace("\n", "\\n")
 
 
+@dataclass(frozen=True)
+class _PromptInputRender:
+    text: str
+    cursor: int
+
+
+def _merge_pasted_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted((start, end) for start, end in ranges if end > start):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _shift_pasted_ranges(
+    ranges: list[tuple[int, int]],
+    *,
+    start: int,
+    inserted_length: int,
+) -> list[tuple[int, int]]:
+    if inserted_length <= 0:
+        return ranges
+    shifted: list[tuple[int, int]] = []
+    for range_start, range_end in ranges:
+        if range_start >= start:
+            shifted.append((range_start + inserted_length, range_end + inserted_length))
+        elif range_start < start < range_end:
+            shifted.append((range_start, range_end + inserted_length))
+        else:
+            shifted.append((range_start, range_end))
+    return shifted
+
+
+def _render_prompt_input(
+    buffer: str,
+    pasted_ranges: list[tuple[int, int]],
+    cursor: int,
+) -> _PromptInputRender:
+    display_parts: list[str] = []
+    display_cursor: int | None = None
+    position = 0
+    buffer_length = len(buffer)
+
+    def append_segment(segment: str) -> None:
+        display_parts.append(_strip_control(segment))
+
+    for start, end in _merge_pasted_ranges(pasted_ranges):
+        start = max(0, min(start, buffer_length))
+        end = max(start, min(end, buffer_length))
+        if end <= position:
+            continue
+        if cursor <= start and display_cursor is None:
+            display_cursor = len("".join(display_parts)) + len(
+                _strip_control(buffer[position:cursor])
+            )
+        append_segment(buffer[position:start])
+        placeholder = f"[Pasted Content {end - start} chars]"
+        if start < cursor <= end and display_cursor is None:
+            display_cursor = len("".join(display_parts)) + len(placeholder)
+        display_parts.append(placeholder)
+        position = end
+
+    if display_cursor is None:
+        display_cursor = len("".join(display_parts)) + len(
+            _strip_control(buffer[position:cursor])
+        )
+    append_segment(buffer[position:])
+    return _PromptInputRender(text="".join(display_parts), cursor=display_cursor)
+
+
 def _display_cwd(path: Path | None = None) -> str:
     cwd = path or Path.cwd()
     home = Path.home()
@@ -593,6 +619,33 @@ def _styled_terminal_line(text: str, style: str, width: int) -> str:
     return f"\x1b[?7l{style}{text[:visible_width].ljust(visible_width)}{RESET}\x1b[?7h"
 
 
+def _running_terminal_line(text: str, width: int, *, frame: int) -> str:
+    visible_width = _terminal_line_width(width)
+    line = text[:visible_width].ljust(visible_width)
+    highlight = frame % (visible_width + 8) - 4
+    parts = ["\x1b[?7l"]
+    for index, char in enumerate(line):
+        distance = abs(index - highlight)
+        if distance == 0:
+            style = "\x1b[40;38;5;51;1m"
+        elif distance == 1:
+            style = "\x1b[40;38;5;87;1m"
+        elif distance <= 3:
+            style = "\x1b[40;38;5;159m"
+        elif distance <= 5:
+            style = "\x1b[40;38;5;250m"
+        else:
+            style = "\x1b[40;38;5;242m"
+        parts.append(f"{style}{char}")
+    parts.append(f"{RESET}\x1b[?7h")
+    return "".join(parts)
+
+
+def _black_terminal_line(text: str, width: int) -> str:
+    visible_width = _terminal_line_width(width)
+    return f"\x1b[?7l\x1b[40;38;5;255m{text[:visible_width].ljust(visible_width)}{RESET}\x1b[?7h"
+
+
 class WillowApp:
     """Append-only native terminal session for Willow."""
 
@@ -617,6 +670,7 @@ class WillowApp:
         self.max_tokens: int = args.max_tokens
         self.max_iterations: int = args.max_iterations
         self.messages: list[Message] = []
+        self.runtime = DEFAULT_RUNTIME
         self.tool_specs = [tool.spec() for tool in TOOLS_BY_NAME.values()]
         self.permission_mode: PermissionMode = getattr(
             args,
@@ -776,15 +830,9 @@ class WillowApp:
         )
 
     def _run_turn(self) -> None:
+        preparer = self._request_preparer()
         for _ in range(self.max_iterations):
-            request = CompletionRequest(
-                model=self.current_model,
-                messages=self._messages_for_request(),
-                max_tokens=self.max_tokens,
-                system=self.system,
-                tools=self.tool_specs,
-            )
-            response = self._drive_stream(request)
+            response = self._drive_stream_with_recovery(preparer)
             self._record_usage(response)
 
             has_tool_uses = any(isinstance(block, ToolUseBlock) for block in response.content)
@@ -795,7 +843,13 @@ class WillowApp:
                 if response.stop_reason == "tool_use"
                 else []
             )
-            step = build_turn_step(response, tool_results=tool_results)
+            monitor_events = self.runtime.events.drain()
+            pending_monitor = monitor_event_text_blocks(monitor_events)
+            step = build_turn_step(
+                response,
+                tool_results=tool_results,
+                pending_user_blocks=pending_monitor,
+            )
             append_turn_step(self.messages, step)
             self._persist_session()
             if not step.continue_running:
@@ -807,68 +861,84 @@ class WillowApp:
         self._write_line(f"[hit max_iterations={self.max_iterations}; returning control]")
         self._write_status_snapshot()
 
+    def _request_preparer(
+        self,
+        *,
+        provider: Provider | None = None,
+        on_compaction_start: Callable[[], None] | None = None,
+        on_compaction_end: Callable[[], None] | None = None,
+    ) -> RequestPreparer:
+        return RequestPreparer(
+            provider=provider or self.provider,
+            model=self.current_model,
+            system=self.system,
+            tools=self.tool_specs,
+            max_tokens=self.max_tokens,
+            context_window=_context_window_for_model(self.current_model),
+            state=self._compaction_state,
+            on_compaction_start=(
+                on_compaction_start or self._write_auto_compacting_status
+            ),
+            on_compaction_end=on_compaction_end,
+        )
+
     def _messages_for_request(
         self,
         *,
         on_compaction_start: Callable[[], None] | None = None,
         on_compaction_end: Callable[[], None] | None = None,
     ) -> list[Message]:
-        messages, state = maybe_compact_messages(
-            provider=self.provider,
-            model=self.current_model,
-            system=self.system,
-            messages=self.messages,
-            tools=self.tool_specs,
-            max_tokens=self.max_tokens,
-            context_window=_context_window_for_model(self.current_model),
-            state=self._compaction_state,
-            on_start=on_compaction_start or self._write_auto_compacting_status,
-            on_end=on_compaction_end,
+        preparer = self._request_preparer(
+            on_compaction_start=on_compaction_start,
+            on_compaction_end=on_compaction_end,
         )
-        self._compaction_state = state
-        if state is not None:
-            self.provider.reset_conversation()
-        return messages
+        prepared = preparer.prepare(self.messages)
+        self._compaction_state = preparer.state
+        return prepared.request.messages
 
     def _write_auto_compacting_status(self) -> None:
         self._write_panel("status", "Auto-compacting...", STATUS_STYLE)
 
-    def _drive_stream(self, request: CompletionRequest) -> CompletionResponse:
+    def _drive_stream_with_recovery(self, preparer: RequestPreparer) -> CompletionResponse:
         final_response: CompletionResponse | None = None
         seen_tools: set[str] = set()
         in_thinking = False
         in_text = False
         wrote_content = False
 
-        for event in self.provider.stream(request):
-            if isinstance(event, TextDelta):
-                if in_thinking:
-                    self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
-                    in_thinking = False
-                self._write_styled(event.text, ASSISTANT_STYLE)
-                in_text = True
-                wrote_content = True
-            elif isinstance(event, ThinkingDelta):
-                if not in_thinking:
-                    if in_text:
-                        self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
-                        in_text = False
-                    if self._styles_enabled():
-                        self._write(f"{THINKING_STYLE} thinking {RESET}\n")
-                    else:
-                        self._write("thinking\n")
-                    in_thinking = True
-                    wrote_content = True
-                self._write_styled(event.thinking, THINKING_STYLE)
-            elif isinstance(event, ToolUseDelta):
-                if event.id not in seen_tools and event.name is not None:
-                    seen_tools.add(event.id)
-                    if in_thinking or in_text:
+        try:
+            events = stream_with_recovery(preparer, self.messages)
+            for event in events:
+                if isinstance(event, TextDelta):
+                    if in_thinking:
                         self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
                         in_thinking = False
-                        in_text = False
-            elif isinstance(event, StreamComplete):
-                final_response = event.response
+                    self._write_styled(event.text, ASSISTANT_STYLE)
+                    in_text = True
+                    wrote_content = True
+                elif isinstance(event, ThinkingDelta):
+                    if not in_thinking:
+                        if in_text:
+                            self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
+                            in_text = False
+                        if self._styles_enabled():
+                            self._write(f"{THINKING_STYLE} thinking {RESET}\n")
+                        else:
+                            self._write("thinking\n")
+                        in_thinking = True
+                        wrote_content = True
+                    self._write_styled(event.thinking, THINKING_STYLE)
+                elif isinstance(event, ToolUseDelta):
+                    if event.id not in seen_tools and event.name is not None:
+                        seen_tools.add(event.id)
+                        if in_thinking or in_text:
+                            self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
+                            in_thinking = False
+                            in_text = False
+                elif isinstance(event, StreamComplete):
+                    final_response = event.response
+        finally:
+            self._compaction_state = preparer.state
 
         if wrote_content:
             self._write(f"{RESET}\n" if self._styles_enabled() else "\n")
@@ -918,7 +988,14 @@ class WillowApp:
             self._write_edit_result(block, result)
             return
         title = _tool_action_title(block, is_error=result.is_error)
-        preview = _compact_lines(result.content, max_lines=4, max_width=110)
+        preview_content = result.content
+        if block.name == "bash":
+            preview_content = "\n".join(
+                line
+                for line in result.content.splitlines()
+                if not line.startswith("[elapsed ")
+            )
+        preview = _compact_lines(preview_content, max_lines=4, max_width=110)
         if not preview:
             preview = ["[no output]"]
         if not self._styles_enabled():
@@ -1364,23 +1441,33 @@ class _LiveTerminal:
         except (AttributeError, OSError):
             self.fd = -1
         self.events: queue.Queue[tuple[int, str, Any]] = queue.Queue()
+        self._unsubscribe_monitor_events = self.app.runtime.events.subscribe(
+            lambda event: self.events.put((-1, "monitor_event", event))
+        )
         self.buffer = ""
         self.cursor = 0
         self.running = True
         self.streaming = False
         self.worker: threading.Thread | None = None
         self.pending_user_inputs: list[str] = []
+        self.pending_monitor_inputs: list[str] = []
+        self.interrupted_user_inputs: list[str] = []
         self.compacting = False
         self._last_compaction_frame_at = 0.0
+        self._last_running_frame_at = 0.0
         self.prompt_lines = 0
         self.prompt_width = 0
+        self.prompt_cursor_line_index = 0
         self.prompt_cursor_offset_from_bottom = 0
+        self.pending_paste_chunks: list[str] | None = None
+        self.pasted_ranges: list[tuple[int, int]] = []
         self.in_text = False
         self.in_thinking = False
         self.seen_tools: set[str] = set()
         self.stream_text: list[str] = []
         self.stream_thinking: list[str] = []
         self.stream_tool_names: list[str] = []
+        self.active_tool_status: str | None = None
         self.active_turn_id = 0
         self.model_picker_choices: list[ModelChoice] | None = None
         self.model_picker_selected = 0
@@ -1388,6 +1475,12 @@ class _LiveTerminal:
         self.input_hint_rows: list[str] | None = None
         self.input_hint_source = ""
         self.input_hint_selected = 0
+        initial_prompt = getattr(self.app.args, "initial_prompt", None)
+        if isinstance(initial_prompt, str) and initial_prompt:
+            self.buffer = initial_prompt
+            self.cursor = len(initial_prompt)
+            if len(initial_prompt) >= PASTE_PLACEHOLDER_MIN_CHARS or "\n" in initial_prompt:
+                self.pasted_ranges = [(0, len(initial_prompt))]
 
     def run(self) -> int:
         self.app._write_welcome_card()
@@ -1412,11 +1505,27 @@ class _LiveTerminal:
                     if should_animate:
                         self._last_compaction_frame_at = time.monotonic()
                         self._draw_prompt()
-                if not self.streaming and self.worker is None and self.pending_user_inputs:
+                    should_animate_running = (
+                        self.active_tool_status is not None
+                        and time.monotonic() - self._last_running_frame_at >= 0.04
+                    )
+                    if should_animate_running:
+                        self._last_running_frame_at = time.monotonic()
+                        self._redraw_running_status_line()
+                if (
+                    not self.streaming
+                    and self.worker is None
+                    and (
+                        self.pending_user_inputs
+                        or self.pending_monitor_inputs
+                        or self.interrupted_user_inputs
+                    )
+                ):
                     self._start_queued_turn()
             except KeyboardInterrupt:
                 self.running = False
         self._clear_prompt()
+        self._unsubscribe_monitor_events()
         self.app._write_line("Goodbye.")
         return 0
 
@@ -1438,16 +1547,27 @@ class _LiveTerminal:
         data = os.read(self.fd, 4096).decode(errors="ignore")
         index = 0
         while index < len(data):
+            if self.pending_paste_chunks is not None:
+                end = data.find("\x1b[201~", index)
+                if end == -1:
+                    self.pending_paste_chunks.append(data[index:])
+                    return
+                self.pending_paste_chunks.append(data[index:end])
+                self._insert_pasted_text("".join(self.pending_paste_chunks))
+                self.pending_paste_chunks = None
+                index = end + 6
+                self._draw_prompt()
+                continue
             if data.startswith("\x1b[200~", index):
                 end = data.find("\x1b[201~", index + 6)
                 if end == -1:
-                    pasted = data[index + 6 :]
+                    self.pending_paste_chunks = [data[index + 6 :]]
                     index = len(data)
                 else:
                     pasted = data[index + 6 : end]
                     index = end + 6
-                self._insert_text(pasted)
-                self._draw_prompt()
+                    self._insert_pasted_text(pasted)
+                    self._draw_prompt()
                 continue
             ch = data[index]
             index += 1
@@ -1462,10 +1582,12 @@ class _LiveTerminal:
             elif ch == "\x15":
                 self.buffer = ""
                 self.cursor = 0
+                self.pasted_ranges = []
                 self._draw_prompt()
             elif ch in ("\x7f", "\b"):
                 if self.cursor > 0:
                     self.buffer = self.buffer[: self.cursor - 1] + self.buffer[self.cursor :]
+                    self.pasted_ranges = []
                     self.cursor -= 1
                 self._draw_prompt()
             elif ch == "\x1b":
@@ -1523,7 +1645,20 @@ class _LiveTerminal:
 
     def _insert_text(self, text: str) -> None:
         self.buffer = self.buffer[: self.cursor] + text + self.buffer[self.cursor :]
+        self.pasted_ranges = _shift_pasted_ranges(
+            self.pasted_ranges,
+            start=self.cursor,
+            inserted_length=len(text),
+        )
         self.cursor += len(text)
+
+    def _insert_pasted_text(self, text: str) -> None:
+        start = self.cursor
+        self._insert_text(text)
+        if len(text) >= PASTE_PLACEHOLDER_MIN_CHARS or "\n" in text:
+            self.pasted_ranges = _merge_pasted_ranges(
+                [*self.pasted_ranges, (start, start + len(text))]
+            )
 
     def _move_cursor_word_left(self) -> None:
         cursor = self.cursor
@@ -1633,6 +1768,7 @@ class _LiveTerminal:
             selected = choices[self.model_picker_selected]
             self.buffer = f"/model {selected.model}"
             self.cursor = len(self.buffer)
+            self.pasted_ranges = []
             self.model_picker_choices = None
             self.model_picker_selected = 0
             return True
@@ -1641,6 +1777,7 @@ class _LiveTerminal:
             provider, _description = LOGIN_PROVIDER_CHOICES[self.login_picker_selected]
             self.buffer = f"/login {provider}"
             self.cursor = len(self.buffer)
+            self.pasted_ranges = []
             self.login_picker_selected = 0
             return True
 
@@ -1654,6 +1791,7 @@ class _LiveTerminal:
             append_space_when_empty=True,
         )
         self.cursor = len(self.buffer)
+        self.pasted_ranges = []
         self.input_hint_rows = None
         self.input_hint_source = ""
         self.input_hint_selected = 0
@@ -1671,6 +1809,7 @@ class _LiveTerminal:
         text = self.buffer.strip()
         self.buffer = ""
         self.cursor = 0
+        self.pasted_ranges = []
         self._clear_prompt()
         if not text:
             self._draw_prompt()
@@ -1700,9 +1839,16 @@ class _LiveTerminal:
             return
 
         self.app._write_block(text, USER_STYLE)
-        self.app.messages.append(
-            Message(role="user", content=[TextBlock(text=expanded_text or text)])
-        )
+        message_text = expanded_text or text
+        if self.interrupted_user_inputs:
+            content = interrupted_user_text_blocks(
+                self.interrupted_user_inputs,
+                [message_text],
+            )
+            self.interrupted_user_inputs = []
+        else:
+            content = [TextBlock(text=message_text)]
+        self.app.messages.append(Message(role="user", content=content))
         self.app._persist_session()
         self._start_worker()
         self._draw_prompt()
@@ -1716,6 +1862,7 @@ class _LiveTerminal:
         if text.strip() in {"/login", "/model"}:
             self.buffer = text.strip()
             self.cursor = len(self.buffer)
+            self.pasted_ranges = []
             self.input_hint_rows = None
             self.input_hint_source = ""
             self.input_hint_selected = 0
@@ -1723,6 +1870,7 @@ class _LiveTerminal:
             return True
         self.buffer = text
         self.cursor = len(self.buffer)
+        self.pasted_ranges = []
         self.input_hint_rows = None
         self.input_hint_source = ""
         self.input_hint_selected = 0
@@ -1734,6 +1882,7 @@ class _LiveTerminal:
         selected_index = self.model_picker_selected
         self.buffer = ""
         self.cursor = 0
+        self.pasted_ranges = []
         self.model_picker_choices = None
         self.model_picker_selected = 0
         self._clear_prompt()
@@ -1753,6 +1902,7 @@ class _LiveTerminal:
         provider, _description = LOGIN_PROVIDER_CHOICES[self.login_picker_selected]
         self.buffer = ""
         self.cursor = 0
+        self.pasted_ranges = []
         self.login_picker_selected = 0
         self._clear_prompt()
         self.app._handle_login(provider)
@@ -1763,11 +1913,34 @@ class _LiveTerminal:
         if text:
             self.buffer = ""
             self.cursor = 0
+            self.pasted_ranges = []
             self.pending_user_inputs.append(text)
         if self.pending_user_inputs:
             self._interrupt_and_send_queued()
         else:
+            self._interrupt_current_turn()
+
+    def _interrupt_current_turn(self) -> None:
+        if not self.streaming:
             self._draw_prompt()
+            return
+        self.active_turn_id += 1
+        self._clear_stream_buffers()
+        self._clear_prompt()
+        interrupted = self._take_trailing_text_user_message()
+        if interrupted:
+            self.interrupted_user_inputs.extend(interrupted)
+            self.app._persist_session()
+        self.streaming = False
+        self.compacting = False
+        self.active_tool_status = None
+        self.app._write_panel(
+            "status",
+            "Interrupted current turn; it will be sent again with your next message.",
+            STATUS_STYLE,
+        )
+        self._reset_provider_for_interrupt()
+        self._draw_prompt()
 
     def _start_queued_turn(self) -> None:
         self._append_pending_user_message(render=True)
@@ -1775,12 +1948,25 @@ class _LiveTerminal:
         self._draw_prompt()
 
     def _append_pending_user_message(self, *, render: bool) -> None:
+        interrupted = self.interrupted_user_inputs
         pending = self.pending_user_inputs
+        monitor_pending = self.pending_monitor_inputs
+        self.interrupted_user_inputs = []
         self.pending_user_inputs = []
+        self.pending_monitor_inputs = []
         if render:
             for text in pending:
                 self.app._write_block(text, USER_STYLE)
-        blocks = queued_user_text_blocks(pending)
+        if interrupted:
+            user_blocks = interrupted_user_text_blocks(interrupted, pending)
+        else:
+            user_blocks = queued_user_text_blocks(pending)
+        blocks = [
+            *user_blocks,
+            *(TextBlock(text=text) for text in monitor_pending),
+        ]
+        if not blocks:
+            return
         self.app.messages.append(Message(role="user", content=list(blocks)))
         self.app._persist_session()
 
@@ -1802,16 +1988,25 @@ class _LiveTerminal:
 
     def _append_interrupted_user_message(self, *, render: bool) -> None:
         pending = self.pending_user_inputs
+        monitor_pending = self.pending_monitor_inputs
         self.pending_user_inputs = []
-        interrupted = self._take_trailing_text_user_message()
+        self.pending_monitor_inputs = []
+        interrupted = [*self.interrupted_user_inputs, *self._take_trailing_text_user_message()]
+        self.interrupted_user_inputs = []
         if render:
             for text in pending:
                 self.app._write_block(text, USER_STYLE)
-        blocks = (
+        user_blocks = (
             interrupted_user_text_blocks(interrupted, pending)
             if interrupted
             else queued_user_text_blocks(pending)
         )
+        blocks = [
+            *user_blocks,
+            *(TextBlock(text=text) for text in monitor_pending),
+        ]
+        if not blocks:
+            return
         self.app.messages.append(Message(role="user", content=list(blocks)))
         self.app._persist_session()
 
@@ -1846,20 +2041,14 @@ class _LiveTerminal:
         self.worker.start()
 
     def _worker_main(self, turn_id: int, provider: Provider) -> None:
+        preparer = self.app._request_preparer(
+            provider=provider,
+            on_compaction_start=lambda: self.events.put((turn_id, "compact_start", None)),
+            on_compaction_end=lambda: self.events.put((turn_id, "compact_end", None)),
+        )
         try:
-            request_messages = self.app._messages_for_request(
-                on_compaction_start=lambda: self.events.put((turn_id, "compact_start", None)),
-                on_compaction_end=lambda: self.events.put((turn_id, "compact_end", None)),
-            )
-            request = CompletionRequest(
-                model=self.app.current_model,
-                messages=request_messages,
-                max_tokens=self.app.max_tokens,
-                system=self.app.system,
-                tools=self.app.tool_specs,
-            )
             final: CompletionResponse | None = None
-            for event in provider.stream(request):
+            for event in stream_with_recovery(preparer, self.app.messages):
                 self.events.put((turn_id, "stream", event))
                 if isinstance(event, StreamComplete):
                     final = event.response
@@ -1868,6 +2057,8 @@ class _LiveTerminal:
             self.events.put((turn_id, "complete", final))
         except Exception as exc:  # noqa: BLE001
             self.events.put((turn_id, "error", exc))
+        finally:
+            self.app._compaction_state = preparer.state
 
     def _drain_events(self) -> None:
         while True:
@@ -1875,6 +2066,9 @@ class _LiveTerminal:
                 turn_id, kind, payload = self.events.get_nowait()
             except queue.Empty:
                 return
+            if kind == "monitor_event":
+                self._queue_monitor_event(cast(dict[str, object], payload))
+                continue
             if turn_id != self.active_turn_id:
                 continue
             if kind == "stream":
@@ -1896,6 +2090,15 @@ class _LiveTerminal:
                 self._draw_prompt()
             if self.running and kind != "stream":
                 self._draw_prompt()
+
+    def _queue_monitor_event(self, event: dict[str, object]) -> None:
+        texts = monitor_event_texts([event])
+        if not texts:
+            return
+        self.pending_monitor_inputs.extend(texts)
+        if self.streaming or self.worker is not None:
+            return
+        self._start_queued_turn()
 
     def _render_stream_event(self, event: Any) -> None:
         if isinstance(event, TextDelta):
@@ -1919,15 +2122,28 @@ class _LiveTerminal:
         if has_tool_uses:
             self.app._write_separator()
         tool_results = (
-            self.app._dispatch_tools(response)
+            self._dispatch_tools_with_prompt(response)
             if response.stop_reason == "tool_use"
             else []
         )
+        if not self.streaming:
+            return
+        interrupted_texts = self.interrupted_user_inputs
         pending_texts = self.pending_user_inputs
+        pending_monitor_texts = self.pending_monitor_inputs
         for text in pending_texts:
             self.app._write_block(text, USER_STYLE)
-        pending = queued_user_text_blocks(pending_texts)
+        if interrupted_texts:
+            user_blocks = interrupted_user_text_blocks(interrupted_texts, pending_texts)
+        else:
+            user_blocks = queued_user_text_blocks(pending_texts)
+        pending = [
+            *user_blocks,
+            *(TextBlock(text=text) for text in pending_monitor_texts),
+        ]
+        self.interrupted_user_inputs = []
         self.pending_user_inputs = []
+        self.pending_monitor_inputs = []
         step = build_turn_step(
             response,
             tool_results=tool_results,
@@ -1942,6 +2158,86 @@ class _LiveTerminal:
         else:
             self.streaming = False
             self.app._write_status_snapshot()
+
+    def _dispatch_tools_with_prompt(
+        self,
+        response: CompletionResponse,
+    ) -> list[ToolResultBlock]:
+        results: list[ToolResultBlock] = []
+        for block in response.content:
+            if not isinstance(block, ToolUseBlock):
+                continue
+            result = self._dispatch_tool_with_animated_prompt(block)
+            self.app._write_tool_result(block, result)
+            results.append(result)
+        return results
+
+    def _dispatch_tool_with_animated_prompt(self, block: ToolUseBlock) -> ToolResultBlock:
+        tool = TOOLS_BY_NAME.get(block.name)
+        if tool is None:
+            return ToolResultBlock(
+                tool_use_id=block.id,
+                content=f"Unknown tool: {block.name!r}",
+                is_error=True,
+            )
+        permission = self.app.permission_gate.check(block)
+        if not permission.allowed:
+            return ToolResultBlock(
+                tool_use_id=block.id,
+                content=permission.denial or "Tool execution denied.",
+                is_error=True,
+            )
+
+        result_box: list[ToolResultBlock] = []
+
+        def run_tool() -> None:
+            result_box.append(self._run_tool_without_permission(block, tool))
+
+        self.active_tool_status = _tool_running_title(block)
+        self._last_running_frame_at = 0.0
+        self._draw_prompt()
+        worker = threading.Thread(
+            target=run_tool,
+            name=f"willow-tool-{block.name}",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            while worker.is_alive():
+                self._read_available_input()
+                if not self.streaming:
+                    return ToolResultBlock(
+                        tool_use_id=block.id,
+                        content="Interrupted by user.",
+                        is_error=True,
+                    )
+                self._last_running_frame_at = time.monotonic()
+                self._redraw_running_status_line()
+                worker.join(timeout=0.04)
+        finally:
+            if self.streaming:
+                worker.join()
+            self._clear_prompt()
+            self.active_tool_status = None
+        if result_box:
+            return result_box[0]
+        return ToolResultBlock(
+            tool_use_id=block.id,
+            content=f"Tool ended without a result: {block.name!r}",
+            is_error=True,
+        )
+
+    @staticmethod
+    def _run_tool_without_permission(block: ToolUseBlock, tool: Tool) -> ToolResultBlock:
+        try:
+            output = tool.run(**block.input)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResultBlock(
+                tool_use_id=block.id,
+                content=f"{type(exc).__name__}: {exc}",
+                is_error=True,
+            )
+        return ToolResultBlock(tool_use_id=block.id, content=output)
 
     def _flush_stream_buffer(self) -> None:
         thinking = "".join(self.stream_thinking)
@@ -1958,34 +2254,44 @@ class _LiveTerminal:
         self.stream_tool_names = []
 
     def _draw_prompt(self) -> None:
-        self._clear_prompt()
+        parts = [self._clear_prompt_sequence()]
         width = self.app._terminal_width()
         line_width = _terminal_line_width(width)
         status = self.app._status_text()
-        preview = _strip_control(self.buffer)
-        cursor = min(len(preview), len(_strip_control(self.buffer[: self.cursor])))
-        self.app._write("\x1b[?25l")
+        rendered_input = _render_prompt_input(self.buffer, self.pasted_ranges, self.cursor)
+        preview = rendered_input.text
+        cursor = min(len(preview), rendered_input.cursor)
+        parts.append("\x1b[?25l")
         prompt_lines = 0
         if self.compacting:
             frame = COMPACTION_FRAMES[int(time.monotonic() * 8) % len(COMPACTION_FRAMES)]
             line = f" {frame} Auto-compacting..."
-            self.app._write(
-                f"{_styled_terminal_line(line, COMPACTION_STYLE, width)}\n"
-            )
+            parts.append(f"{_styled_terminal_line(line, COMPACTION_STYLE, width)}\n")
             prompt_lines += 1
         elif self.streaming:
-            self.app._write(f"{_styled_terminal_line(' working...', STATUS_STYLE, width)}\n")
+            parts.append(f"{self._running_status_line(width)}\n")
             prompt_lines += 1
+            if self.active_tool_status is not None:
+                parts.append(f"{_black_terminal_line('', width)}\n")
+                prompt_lines += 1
+        if self.interrupted_user_inputs:
+            title = " Interrupted messages to be sent with your next message"
+            parts.append(f"{_styled_terminal_line(title, STATUS_STYLE, width)}\n")
+            prompt_lines += 1
+            for text in self.interrupted_user_inputs:
+                line = f"  ↳ {_strip_control(text)}"
+                parts.append(f"{_styled_terminal_line(line, STATUS_STYLE, width)}\n")
+                prompt_lines += 1
         if self.pending_user_inputs:
             title = " Messages to be submitted after next tool call"
             hint = " (press esc to interrupt and send immediately)"
-            self.app._write(f"{_styled_terminal_line(title, STATUS_STYLE, width)}\n")
+            parts.append(f"{_styled_terminal_line(title, STATUS_STYLE, width)}\n")
             prompt_lines += 1
-            self.app._write(f"{_styled_terminal_line(hint, STATUS_STYLE, width)}\n")
+            parts.append(f"{_styled_terminal_line(hint, STATUS_STYLE, width)}\n")
             prompt_lines += 1
             for text in self.pending_user_inputs:
                 line = f"  ↳ {_strip_control(text)}"
-                self.app._write(f"{_styled_terminal_line(line, STATUS_STYLE, width)}\n")
+                parts.append(f"{_styled_terminal_line(line, STATUS_STYLE, width)}\n")
                 prompt_lines += 1
         prefix = " > "
         continuation_prefix = " " * len(prefix)
@@ -2017,13 +2323,20 @@ class _LiveTerminal:
             cursor_column += len(prefix)
         else:
             cursor_column += len(continuation_prefix)
-        prompt_line_index = prompt_lines + cursor_line
+        input_box_start = prompt_lines
+        parts.append(_styled_terminal_line("", PROMPT_STYLE, width))
+        parts.append("\n")
+        prompt_lines += 1
+        prompt_line_index = input_box_start + 1 + cursor_line
         for line_index, line in enumerate(input_lines):
             if line_index:
-                self.app._write("\n")
+                parts.append("\n")
             display = f"{prefix}{line}" if line_index == 0 else f"{continuation_prefix}{line}"
-            self.app._write(_styled_terminal_line(display, PROMPT_STYLE, width))
+            parts.append(_styled_terminal_line(display, PROMPT_STYLE, width))
             prompt_lines += 1
+        parts.append("\n")
+        parts.append(_styled_terminal_line("", PROMPT_STYLE, width))
+        prompt_lines += 1
         model_picker_choices = self._ensure_model_picker()
         if model_picker_choices is not None:
             rows = _render_model_picker_rows(
@@ -2034,7 +2347,7 @@ class _LiveTerminal:
                 styles_enabled=self.app._styles_enabled(),
             )
             for row in rows:
-                self.app._write(f"\n\x1b[?7l{row}\x1b[?7h")
+                parts.append(f"\n\x1b[?7l{row}\x1b[?7h")
                 prompt_lines += 1
         elif self._login_picker_active():
             rows = _render_login_picker_rows(
@@ -2043,7 +2356,7 @@ class _LiveTerminal:
                 styles_enabled=self.app._styles_enabled(),
             )
             for row in rows:
-                self.app._write(f"\n\x1b[?7l{row}\x1b[?7h")
+                parts.append(f"\n\x1b[?7l{row}\x1b[?7h")
                 prompt_lines += 1
         else:
             input_hints = self._ensure_input_hints()
@@ -2055,43 +2368,77 @@ class _LiveTerminal:
                     styles_enabled=self.app._styles_enabled(),
                 )
                 for row in rows:
-                    self.app._write(f"\n\x1b[?7l{row}\x1b[?7h")
+                    parts.append(f"\n\x1b[?7l{row}\x1b[?7h")
                     prompt_lines += 1
             elif self.app._statusline_enabled:
                 line = f" {status}"[:line_width].ljust(line_width)
-                self.app._write(
+                parts.append(
                     f"\n\x1b[?7l{STATUS_STYLE}{_style_statusline_text(line)}{RESET}\x1b[?7h"
                 )
                 prompt_lines += 1
         self.prompt_lines = prompt_lines
         self.prompt_width = line_width
+        self.prompt_cursor_line_index = prompt_line_index
         self.prompt_cursor_offset_from_bottom = prompt_lines - prompt_line_index - 1
-        self._place_prompt_cursor(cursor_column)
+        parts.append(self._place_prompt_cursor_sequence(cursor_column))
+        self.app._write("".join(parts))
+
+    def _running_status_line(self, width: int) -> str:
+        running_text = self.active_tool_status or "working..."
+        if self.active_tool_status is not None and self.app._styles_enabled():
+            frame = int(time.monotonic() * 48)
+            return _running_terminal_line(f" {running_text}", width, frame=frame)
+        return _styled_terminal_line(f" {running_text}", STATUS_STYLE, width)
+
+    def _redraw_running_status_line(self) -> None:
+        if self.active_tool_status is None or self.prompt_lines == 0:
+            return
+        width = self.app._terminal_width()
+        parts = ["\x1b7\x1b[?25l"]
+        if self.prompt_cursor_line_index:
+            parts.append(f"\x1b[{self.prompt_cursor_line_index}A")
+        parts.append("\r")
+        parts.append(self._running_status_line(width))
+        parts.append("\x1b8\x1b[?25h")
+        self.app._write("".join(parts))
 
     def _place_prompt_cursor(self, column: int) -> None:
+        self.app._write(self._place_prompt_cursor_sequence(column))
+
+    def _place_prompt_cursor_sequence(self, column: int) -> str:
+        parts: list[str] = []
         if self.prompt_cursor_offset_from_bottom:
-            self.app._write(f"\x1b[{self.prompt_cursor_offset_from_bottom}A")
-        self.app._write("\r")
+            parts.append(f"\x1b[{self.prompt_cursor_offset_from_bottom}A")
+        parts.append("\r")
         if column:
-            self.app._write(f"\x1b[{column}C")
-        self.app._write("\x1b[?25h")
+            parts.append(f"\x1b[{column}C")
+        parts.append("\x1b[?25h")
+        return "".join(parts)
 
     def _clear_prompt(self) -> None:
+        sequence = self._clear_prompt_sequence()
+        if sequence:
+            self.app._write(sequence)
+
+    def _clear_prompt_sequence(self) -> str:
         if self.prompt_lines == 0:
-            return
+            return ""
         current_width = _terminal_line_width(self.app._terminal_width())
         previous_width = self.prompt_width or current_width
         wrap_factor = max(1, (previous_width + current_width - 1) // current_width)
         rows_to_clear = self.prompt_lines * wrap_factor
+        parts: list[str] = []
         if self.prompt_cursor_offset_from_bottom:
-            self.app._write(f"\x1b[{self.prompt_cursor_offset_from_bottom * wrap_factor}B")
+            parts.append(f"\x1b[{self.prompt_cursor_offset_from_bottom * wrap_factor}B")
             self.prompt_cursor_offset_from_bottom = 0
-        self.app._write("\x1b[?25l\r\x1b[2K")
+        parts.append("\x1b[?25l\r\x1b[2K")
         for _ in range(rows_to_clear - 1):
-            self.app._write("\x1b[1A\r\x1b[2K")
-        self.app._write("\x1b[?25h")
+            parts.append("\x1b[1A\r\x1b[2K")
+        parts.append("\x1b[?25h")
         self.prompt_lines = 0
         self.prompt_width = 0
+        self.prompt_cursor_line_index = 0
+        return "".join(parts)
 
 
 def _state_from_session(record: SessionRecord) -> dict[str, object]:

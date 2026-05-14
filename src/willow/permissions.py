@@ -34,7 +34,7 @@ class PermissionResult:
 
 PermissionPrompt = Callable[[ToolUseBlock], PermissionAnswer]
 
-READ_ONLY_TOOLS = frozenset({"read", "grep"})
+READ_ONLY_TOOLS = frozenset({"read"})
 
 
 class PermissionGate:
@@ -88,8 +88,4 @@ def tool_permission_summary(block: ToolUseBlock) -> str:
         return f"bash: {block.input.get('command', '<missing command>')}"
     if block.name in {"read", "write", "edit"}:
         return f"{block.name}: {block.input.get('path', '<missing path>')}"
-    if block.name == "grep":
-        pattern = block.input.get("pattern", "<missing pattern>")
-        path = block.input.get("path", ".")
-        return f"grep: {pattern} in {path}"
     return f"{block.name}: {block.input}"

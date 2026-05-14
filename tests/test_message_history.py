@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from willow.message_history import interrupted_user_text_blocks, queued_user_text_blocks
+from willow.message_history import (
+    interrupted_user_text_blocks,
+    monitor_event_text_blocks,
+    queued_user_text_blocks,
+)
 from willow.providers import TextBlock
 
 
@@ -19,6 +23,45 @@ def test_multiple_queued_user_texts_are_labeled() -> None:
 
 def test_interrupted_user_texts_are_labeled_with_interrupt_context() -> None:
     assert interrupted_user_text_blocks(["old"], ["new"]) == [
-        TextBlock(text="[interrupted user message 1 of 2]\nold"),
-        TextBlock(text="[interrupting user message 2 of 2]\nnew"),
+        TextBlock(
+            text=(
+                "The previous assistant response was interrupted before completion. "
+                "Answer each active user message below now, in order.\n\n"
+                "[active user message 1 of 2; interrupted before completion]\nold\n\n"
+                "[active user message 2 of 2; new message after interruption]\nnew"
+            )
+        ),
     ]
+
+
+def test_monitor_events_render_as_queued_user_text_blocks() -> None:
+    blocks = monitor_event_text_blocks(
+        [
+            {
+                "event_type": "pattern_match",
+                "severity": "warning",
+                "monitor_id": "monitor-1",
+                "task_id": "shell-1",
+                "status": "running",
+                "summary": "matched ERROR",
+                "tail": "ERROR here",
+            }
+        ]
+    )
+
+    assert len(blocks) == 1
+    assert blocks[0].text == "Monitor event: matched ERROR"
+
+
+def test_monitor_event_without_summary_uses_compact_fallback() -> None:
+    blocks = monitor_event_text_blocks(
+        [
+            {
+                "event_type": "terminal_summary",
+                "status": "completed",
+                "tail": "verbose output omitted",
+            }
+        ]
+    )
+
+    assert blocks == [TextBlock(text="Monitor event: terminal_summary (completed)")]

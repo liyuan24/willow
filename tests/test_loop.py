@@ -21,6 +21,7 @@ from willow.providers import (
     ToolUseBlock,
     ToolUseDelta,
 )
+from willow.runtime import WillowRuntime
 from willow.tools import BashTool
 
 
@@ -90,6 +91,71 @@ def test_loop_runs_tool_and_terminates() -> None:
     assert "hello" in result.content[0].text
 
 
+def test_loop_retries_context_length_error_with_compacted_history() -> None:
+    class HugeTool:
+        name = "huge"
+        description = "returns a large payload"
+        input_schema = {"type": "object", "properties": {}}
+
+        def spec(self) -> dict:
+            return {
+                "name": self.name,
+                "description": self.description,
+                "input_schema": self.input_schema,
+            }
+
+        def run(self, **_: object) -> str:
+            return "x" * 30_000
+
+    class ContextRetryProvider(Provider):
+        def __init__(self) -> None:
+            self.complete_requests: list[CompletionRequest] = []
+            self.summary_requests: list[CompletionRequest] = []
+
+        def complete(self, request: CompletionRequest) -> CompletionResponse:
+            self.complete_requests.append(request)
+            if len(self.complete_requests) == 1:
+                return CompletionResponse(
+                    content=[ToolUseBlock(id="call_1", name="huge", input={})],
+                    stop_reason="tool_use",
+                )
+            if len(self.complete_requests) == 2:
+                raise RuntimeError("context_length_exceeded")
+            return CompletionResponse(
+                content=[TextBlock(text="recovered")],
+                stop_reason="end_turn",
+            )
+
+        def stream(self, request: CompletionRequest) -> Iterator[StreamEvent]:
+            self.summary_requests.append(request)
+            yield StreamComplete(
+                response=CompletionResponse(
+                    content=[TextBlock(text="summary of huge tool result")],
+                    stop_reason="end_turn",
+                )
+            )
+
+    provider = ContextRetryProvider()
+
+    result = run(
+        provider=provider,
+        tools_by_name={"huge": HugeTool()},  # type: ignore[dict-item]
+        system=None,
+        user_input="run huge",
+        model="stub-model",
+    )
+
+    assert result.content == [TextBlock(text="recovered")]
+    assert len(provider.complete_requests) == 3
+    raw_retry = provider.complete_requests[1]
+    compacted_retry = provider.complete_requests[2]
+    assert "x" * 100 in cast_request_text(raw_retry)
+    compacted_text = cast_request_text(compacted_retry)
+    assert "summary of huge tool result" in compacted_text
+    assert "x" * 100 not in compacted_text
+    assert len(provider.summary_requests) == 1
+
+
 def test_loop_reports_tool_errors_as_blocks() -> None:
     """Tool exceptions become ToolResultBlock(is_error=True), not raises."""
 
@@ -135,6 +201,62 @@ def test_loop_reports_tool_errors_as_blocks() -> None:
     assert err_block.is_error is True
     assert "kaboom" in err_block.content
     assert result.stop_reason == "end_turn"
+
+
+def test_loop_adds_monitor_events_to_tool_followup_message() -> None:
+    runtime = WillowRuntime()
+
+    class EmitEventTool:
+        name = "emit_event"
+        description = "emit a monitor event"
+        input_schema = {"type": "object", "properties": {}}
+
+        def __init__(self) -> None:
+            self.runtime = runtime
+
+        def spec(self) -> dict:
+            return {
+                "name": self.name,
+                "description": self.description,
+                "input_schema": self.input_schema,
+            }
+
+        def run(self, **_: object) -> str:
+            runtime.events.publish(
+                {
+                    "event_type": "pattern_match",
+                    "severity": "warning",
+                    "monitor_id": "monitor-1",
+                    "task_id": "shell-1",
+                    "status": "running",
+                    "summary": "matched ERROR",
+                    "tail": "ERROR here",
+                }
+            )
+            return "event emitted"
+
+    tool = EmitEventTool()
+    scripted = [
+        CompletionResponse(
+            content=[ToolUseBlock(id="emit-1", name=tool.name, input={})],
+            stop_reason="tool_use",
+        ),
+        CompletionResponse(content=[TextBlock(text="done")], stop_reason="end_turn"),
+    ]
+    provider = StubProvider(scripted)
+
+    run(
+        provider=provider,
+        tools_by_name={tool.name: tool},  # type: ignore[dict-item]
+        system=None,
+        user_input="emit",
+        model="stub-model",
+    )
+
+    followup = provider.requests[1].messages[2]
+    assert isinstance(followup.content[0], ToolResultBlock)
+    assert isinstance(followup.content[1], TextBlock)
+    assert followup.content[1].text == "Monitor event: matched ERROR"
 
 
 def test_loop_unknown_tool_is_an_error_block() -> None:
@@ -410,3 +532,16 @@ def test_run_streaming_respects_max_iterations() -> None:
 
     assert len(provider.requests) == 3
     assert result.stop_reason == "tool_use"
+
+
+def cast_request_text(request: CompletionRequest) -> str:
+    parts: list[str] = []
+    for message in request.messages:
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                parts.append(block.text)
+            elif isinstance(block, ToolResultBlock):
+                parts.append(block.content)
+            elif isinstance(block, ToolUseBlock):
+                parts.append(block.name)
+    return "\n".join(parts)

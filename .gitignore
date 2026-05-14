@@ -12,3 +12,7 @@ wheels/
 # Local debug output
 debug_images/
 system_prompt_investigation.md
+.willow/jobs/
+.willow/**/*.txt
+design_log/
+tbench/

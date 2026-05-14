@@ -22,6 +22,7 @@ def test_build_parser_defaults_to_tui_settings() -> None:
     assert args.model == "gpt-5.5"
     assert args.max_tokens == 4096
     assert args.max_iterations == 20
+    assert args.initial_prompt is None
     assert args.resume is None
     assert args.permission_mode == cli.PermissionMode.YOLO
 
@@ -60,6 +61,14 @@ def test_build_parser_resume_accepts_optional_session() -> None:
 
     assert choose_args.resume == ""
     assert direct_args.resume == "sess_123"
+
+
+def test_build_parser_accepts_initial_prompt_for_tui() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(["--initial-prompt", "do the task"])
+
+    assert args.initial_prompt == "do the task"
+    assert args.prompt is None
 
 
 def test_build_parser_rejects_removed_subcommands() -> None:
