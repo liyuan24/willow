@@ -115,6 +115,8 @@ def _make_args(**overrides: Any) -> argparse.Namespace:
         system=None,
         max_tokens=4096,
         max_iterations=20,
+        thinking=False,
+        effort=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -1640,6 +1642,53 @@ def test_live_left_arrow_moves_cursor_for_mid_buffer_edit() -> None:
 
     assert live.buffer == "aXbc"
     assert live.cursor == 2
+
+
+def test_live_up_and_down_arrows_navigate_input_history() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.input_history = ["first prompt", "second prompt"]
+    read_fd, write_fd = os.pipe()
+    try:
+        live.fd = read_fd
+        os.write(write_fd, b"draft\x1b[A")
+        live._read_available_input()
+        assert live.buffer == "second prompt"
+        assert live.cursor == len("second prompt")
+
+        os.write(write_fd, b"\x1b[A")
+        live._read_available_input()
+        assert live.buffer == "first prompt"
+
+        os.write(write_fd, b"\x1b[B")
+        live._read_available_input()
+        assert live.buffer == "second prompt"
+
+        os.write(write_fd, b"\x1b[B")
+        live._read_available_input()
+        assert live.buffer == "draft"
+        assert live.cursor == len("draft")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_live_submit_records_prompt_for_input_history() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.buffer = "remember this"
+    live.cursor = len(live.buffer)
+    live._start_worker = lambda: None  # type: ignore[method-assign]
+
+    live._submit_buffer()
+    live._move_input_history(-1)
+
+    assert live.buffer == "remember this"
+    assert live.cursor == len("remember this")
 
 
 def test_live_bracketed_paste_split_across_reads_preserves_newlines() -> None:

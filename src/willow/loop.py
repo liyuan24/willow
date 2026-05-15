@@ -15,6 +15,7 @@ defined in `willow.providers.base`.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from typing import Literal
 
 from .message_history import monitor_event_text_blocks
 from .permissions import PermissionGate
@@ -43,6 +44,8 @@ def run(
     max_iterations: int = 20,
     permission_gate: PermissionGate | None = None,
     context_window: int | None = None,
+    thinking: bool = False,
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
 ) -> CompletionResponse:
     """Run the agent loop until the model stops or `max_iterations` is hit.
 
@@ -70,6 +73,8 @@ def run(
         system=system,
         tools=tool_specs,
         max_tokens=max_tokens,
+        thinking=thinking,
+        effort=effort,
         context_window=context_window,
     )
 
@@ -116,6 +121,8 @@ def run_streaming(
     on_event: Callable[[StreamEvent], None] = lambda _e: None,
     permission_gate: PermissionGate | None = None,
     context_window: int | None = None,
+    thinking: bool = False,
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
 ) -> CompletionResponse:
     """Run the agent loop using streaming for each model turn.
 
@@ -145,6 +152,8 @@ def run_streaming(
         system=system,
         tools=tool_specs,
         max_tokens=max_tokens,
+        thinking=thinking,
+        effort=effort,
         context_window=context_window,
     )
 

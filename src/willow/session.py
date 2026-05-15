@@ -15,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from willow.providers import (
     ContentBlock,
@@ -54,6 +54,8 @@ class SessionSettings:
     system: str | None = None
     max_tokens: int = 4096
     max_iterations: int = 20
+    thinking: bool = False
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +83,8 @@ def new_session(
     system: str | None = None,
     max_tokens: int = 4096,
     max_iterations: int = 20,
+    thinking: bool = False,
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
     title: str | None = None,
     cwd: str | None = None,
 ) -> SessionRecord:
@@ -93,6 +97,8 @@ def new_session(
             system=system,
             max_tokens=max_tokens,
             max_iterations=max_iterations,
+            thinking=thinking,
+            effort=effort,
         ),
     )
 
@@ -235,6 +241,8 @@ def settings_to_dict(settings: SessionSettings) -> dict[str, Any]:
         "system": settings.system,
         "max_tokens": settings.max_tokens,
         "max_iterations": settings.max_iterations,
+        "thinking": settings.thinking,
+        "effort": settings.effort,
     }
 
 
@@ -245,6 +253,8 @@ def settings_from_dict(data: dict[str, Any]) -> SessionSettings:
         system=_optional_str(data, "system"),
         max_tokens=_require_int(data, "max_tokens"),
         max_iterations=_require_int(data, "max_iterations"),
+        thinking=_optional_bool(data, "thinking", default=False),
+        effort=_optional_effort(data, "effort"),
     )
 
 
@@ -384,6 +394,24 @@ def _require_bool(data: dict[str, Any], key: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{key!r} must be a boolean")
     return value
+
+
+def _optional_bool(data: dict[str, Any], key: str, *, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key!r} must be a boolean")
+    return value
+
+
+def _optional_effort(
+    data: dict[str, Any], key: str
+) -> Literal["low", "medium", "high", "xhigh", "max"] | None:
+    value = _optional_str(data, key)
+    if value is None:
+        return None
+    if value not in {"low", "medium", "high", "xhigh", "max"}:
+        raise ValueError(f"{key!r} has unsupported effort: {value!r}")
+    return cast(Literal["low", "medium", "high", "xhigh", "max"], value)
 
 
 def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:

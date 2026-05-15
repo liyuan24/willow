@@ -596,6 +596,24 @@ def _history_ends_with_tool_results(messages: list[Message]) -> bool:
     )
 
 
+def _input_history_from_messages(messages: list[Message]) -> list[str]:
+    history: list[str] = []
+    for message in messages:
+        if message.role != "user":
+            continue
+        text_blocks = [
+            block.text.strip()
+            for block in message.content
+            if isinstance(block, TextBlock) and block.text.strip()
+        ]
+        if not text_blocks:
+            continue
+        text = "\n\n".join(text_blocks)
+        if not history or history[-1] != text:
+            history.append(text)
+    return history
+
+
 def _wrap_terminal_line(line: str, width: int) -> list[str]:
     return textwrap.wrap(
         line,
@@ -669,6 +687,8 @@ class WillowApp:
         self.current_model: str = args.model
         self.max_tokens: int = args.max_tokens
         self.max_iterations: int = args.max_iterations
+        self.thinking: bool = bool(getattr(args, "thinking", False))
+        self.effort: str | None = cast(str | None, getattr(args, "effort", None))
         self.messages: list[Message] = []
         self.runtime = DEFAULT_RUNTIME
         self.tool_specs = [tool.spec() for tool in TOOLS_BY_NAME.values()]
@@ -719,6 +739,8 @@ class WillowApp:
                     system=self.system,
                     max_tokens=self.max_tokens,
                     max_iterations=self.max_iterations,
+                    thinking=self.thinking,
+                    effort=cast(Any, self.effort),
                 )
                 self._session_path = default_session_path(self._session_record.metadata.id)
             self._persist_session()
@@ -783,6 +805,8 @@ class WillowApp:
             "system": self.system,
             "max_tokens": self.max_tokens,
             "max_iterations": self.max_iterations,
+            "thinking": self.thinking,
+            "effort": self.effort,
             "permission_mode": self.permission_mode,
             "messages": list(self.messages),
             "statusline_enabled": self._statusline_enabled,
@@ -802,6 +826,8 @@ class WillowApp:
         self.max_iterations = int(
             cast(Any, state.get("max_iterations", self.max_iterations))
         )
+        self.thinking = bool(state.get("thinking", self.thinking))
+        self.effort = cast(str | None, state.get("effort", self.effort))
         self.permission_mode = cast(
             PermissionMode,
             state.get("permission_mode", self.permission_mode),
@@ -874,6 +900,8 @@ class WillowApp:
             system=self.system,
             tools=self.tool_specs,
             max_tokens=self.max_tokens,
+            thinking=self.thinking,
+            effort=cast(Any, self.effort),
             context_window=_context_window_for_model(self.current_model),
             state=self._compaction_state,
             on_compaction_start=(
@@ -1178,6 +1206,9 @@ class WillowApp:
         self._write_line(f"  provider:      {self.current_provider_name}")
         self._write_line(f"  model:         {self.current_model}")
         self._write_line(f"  max_tokens:    {self.max_tokens}")
+        self._write_line(f"  thinking:      {'on' if self.thinking else 'off'}")
+        if self.effort is not None:
+            self._write_line(f"  effort:        {self.effort}")
         self._write_line(f"  mode:          {self.permission_mode.value}")
         self._write_line(f"  message count: {len(self.messages)}")
         self._write_line(f"  persistence:   {self._session_persistence_text()}")
@@ -1188,6 +1219,8 @@ class WillowApp:
             f"persistence: {self._session_persistence_text()}",
             f"session: {self._session_path_text()}",
             f"mode: {self.permission_mode.value}",
+            f"thinking: {'on' if self.thinking else 'off'}",
+            f"effort: {self.effort or '(provider default)'}",
             f"messages: {len(self.messages)}",
             f"statusline: {'on' if self._statusline_enabled else 'off'}",
             self._status_text(),
@@ -1372,6 +1405,8 @@ class WillowApp:
                 system=self.system,
                 max_tokens=self.max_tokens,
                 max_iterations=self.max_iterations,
+                thinking=self.thinking,
+                effort=cast(Any, self.effort),
             ),
             messages=list(self.messages),
         )
@@ -1475,6 +1510,9 @@ class _LiveTerminal:
         self.input_hint_rows: list[str] | None = None
         self.input_hint_source = ""
         self.input_hint_selected = 0
+        self.input_history = _input_history_from_messages(self.app.messages)
+        self.input_history_index: int | None = None
+        self.input_history_draft = ""
         initial_prompt = getattr(self.app.args, "initial_prompt", None)
         if isinstance(initial_prompt, str) and initial_prompt:
             self.buffer = initial_prompt
@@ -1608,11 +1646,11 @@ class _LiveTerminal:
                     index += 5
                     self._draw_prompt()
                 elif data.startswith("[A", index) or data.startswith("OA", index):
-                    self._move_picker_selection(-1)
+                    self._move_picker_or_history(-1)
                     index += 2
                     self._draw_prompt()
                 elif data.startswith("[B", index) or data.startswith("OB", index):
-                    self._move_picker_selection(1)
+                    self._move_picker_or_history(1)
                     index += 2
                     self._draw_prompt()
                 elif data.startswith("[D", index):
@@ -1760,6 +1798,52 @@ class _LiveTerminal:
         else:
             self._move_input_hint_selection(delta)
 
+    def _move_picker_or_history(self, delta: int) -> None:
+        if self._model_picker_active() or self._login_picker_active():
+            self._move_picker_selection(delta)
+            return
+
+        if self._ensure_input_hints():
+            self._move_input_hint_selection(delta)
+            return
+
+        self._move_input_history(delta)
+
+    def _move_input_history(self, delta: int) -> None:
+        if not self.input_history:
+            return
+        if self.input_history_index is None:
+            if delta >= 0:
+                return
+            self.input_history_draft = self.buffer
+            next_index = len(self.input_history) - 1
+        else:
+            next_index = self.input_history_index + delta
+
+        if next_index < 0:
+            next_index = 0
+        if next_index >= len(self.input_history):
+            self.input_history_index = None
+            self._replace_input_buffer(self.input_history_draft)
+            return
+
+        self.input_history_index = next_index
+        self._replace_input_buffer(self.input_history[next_index])
+
+    def _replace_input_buffer(self, text: str) -> None:
+        self.buffer = text
+        self.cursor = len(text)
+        self.pasted_ranges = []
+        self.input_hint_rows = None
+        self.input_hint_source = ""
+        self.input_hint_selected = 0
+
+    def _record_input_history(self, text: str) -> None:
+        if not self.input_history or self.input_history[-1] != text:
+            self.input_history.append(text)
+        self.input_history_index = None
+        self.input_history_draft = ""
+
     def _complete_selected_hint(self) -> bool:
         if self._model_picker_active():
             choices = self._ensure_model_picker()
@@ -1814,6 +1898,7 @@ class _LiveTerminal:
         if not text:
             self._draw_prompt()
             return
+        self._record_input_history(text)
         if self.streaming:
             self.pending_user_inputs.append(text)
             if text.startswith("/"):
@@ -2456,6 +2541,8 @@ def _state_from_session(record: SessionRecord) -> dict[str, object]:
         "system": record.settings.system,
         "max_tokens": record.settings.max_tokens,
         "max_iterations": record.settings.max_iterations,
+        "thinking": record.settings.thinking,
+        "effort": record.settings.effort,
         "messages": list(record.messages),
         "statusline_enabled": True,
         "last_context_tokens": last_context_tokens,
@@ -2474,6 +2561,8 @@ def _apply_resumed_session(
     args.model = record.settings.model
     args.max_tokens = record.settings.max_tokens
     args.max_iterations = record.settings.max_iterations
+    args.thinking = record.settings.thinking
+    args.effort = record.settings.effort
     args._resume_session_record = record
     args._resume_session_path = path
     return _state_from_session(record)

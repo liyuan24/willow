@@ -108,6 +108,8 @@ def test_anthropic_provider_wires_anthropic_vendor_key(
         "claude-x",
         512,
         3,
+        thinking=False,
+        effort=None,
     )
     assert result is loop_run_sentinel.sentinel
 
@@ -191,6 +193,8 @@ def test_openai_completions_provider_wires_openai_vendor_key(
         "gpt-x",
         4096,
         20,
+        thinking=False,
+        effort=None,
     )
     assert result is loop_run_sentinel.sentinel
 

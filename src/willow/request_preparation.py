@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import Literal
 
 from willow.compaction import (
     RuntimeCompaction,
@@ -53,6 +54,8 @@ class RequestPreparer:
         system: str | None,
         tools: list[dict[str, object]],
         max_tokens: int,
+        thinking: bool = False,
+        effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
         context_window: int | None = None,
         state: RuntimeCompaction | None = None,
         on_compaction_start: Callable[[], None] | None = None,
@@ -63,6 +66,8 @@ class RequestPreparer:
         self.system = system
         self.tools = tools
         self.max_tokens = max_tokens
+        self.thinking = thinking
+        self.effort = effort
         self.context_window = (
             context_window_for_model(model) if context_window is None else context_window
         )
@@ -105,6 +110,8 @@ class RequestPreparer:
                 max_tokens=self.max_tokens,
                 system=self.system,
                 tools=self.tools,
+                thinking=self.thinking,
+                effort=self.effort,
             ),
             context_tokens=context_tokens,
             request_bytes=estimate_serialized_request_bytes(
@@ -113,6 +120,8 @@ class RequestPreparer:
                 max_tokens=self.max_tokens,
                 system=self.system,
                 tools=self.tools,
+                thinking=self.thinking,
+                effort=self.effort,
             ),
             compacted=compacted,
         )
@@ -164,6 +173,8 @@ def estimate_serialized_request_bytes(
     max_tokens: int,
     system: str | None,
     tools: list[dict[str, object]],
+    thinking: bool = False,
+    effort: str | None = None,
 ) -> int:
     payload = {
         "model": model,
@@ -171,5 +182,7 @@ def estimate_serialized_request_bytes(
         "max_tokens": max_tokens,
         "system": system,
         "tools": tools,
+        "thinking": thinking,
+        "effort": effort,
     }
     return len(json.dumps(payload, sort_keys=True, default=str).encode("utf-8"))

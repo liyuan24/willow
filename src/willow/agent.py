@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import anthropic
 import openai
@@ -100,6 +101,8 @@ def run_agent(
     max_tokens: int = 4096,
     max_iterations: int = 20,
     permission_mode: PermissionMode = PermissionMode.YOLO,
+    thinking: bool = False,
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None,
 ) -> CompletionResponse:
     """Construct the right provider, wire its credential from ``willow.auth``,
     and run the agent loop with all registered tools.
@@ -111,6 +114,8 @@ def run_agent(
         user_input: First user turn.
         max_tokens: Forwarded to the provider per turn.
         max_iterations: Hard cap on assistant turns before the loop exits.
+        thinking: Enable provider reasoning controls.
+        effort: Requested reasoning effort when ``thinking`` is enabled.
 
     Raises:
         ValueError: If ``provider_name`` is not a recognized provider.
@@ -142,6 +147,8 @@ def run_agent(
             model,
             max_tokens,
             max_iterations,
+            thinking=thinking,
+            effort=effort,
         )
 
     return loop.run(
@@ -153,4 +160,6 @@ def run_agent(
         max_tokens,
         max_iterations,
         permission_gate=PermissionGate(permission_mode),
+        thinking=thinking,
+        effort=effort,
     )

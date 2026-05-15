@@ -103,6 +103,8 @@ def test_session_record_round_trips_through_json_file(tmp_path: Path) -> None:
         "system": "Be concise.",
         "max_tokens": 2048,
         "max_iterations": 7,
+        "thinking": False,
+        "effort": None,
     }
     assert raw["messages"][1]["content"][0] == {
         "type": "thinking",

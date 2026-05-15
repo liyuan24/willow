@@ -22,6 +22,8 @@ def test_build_parser_defaults_to_tui_settings() -> None:
     assert args.model == "gpt-5.5"
     assert args.max_tokens == 4096
     assert args.max_iterations == 20
+    assert args.thinking is False
+    assert args.effort is None
     assert args.initial_prompt is None
     assert args.resume is None
     assert args.permission_mode == cli.PermissionMode.YOLO
@@ -39,6 +41,9 @@ def test_build_parser_print_mode_accepts_prompt_and_shared_flags() -> None:
             "512",
             "--max-iterations",
             "3",
+            "--thinking",
+            "--effort",
+            "high",
             "--read-only",
             "-p",
             "follow the prompt",
@@ -50,6 +55,8 @@ def test_build_parser_print_mode_accepts_prompt_and_shared_flags() -> None:
     assert args.model == "claude-sonnet-4-6"
     assert args.max_tokens == 512
     assert args.max_iterations == 3
+    assert args.thinking is True
+    assert args.effort == "high"
     assert args.permission_mode == cli.PermissionMode.READ_ONLY
 
 
@@ -162,6 +169,8 @@ def test_headless_calls_run_agent_and_prints_final_text(
                 "max_tokens": 512,
                 "max_iterations": 3,
                 "permission_mode": cli.PermissionMode.READ_ONLY,
+                "thinking": False,
+                "effort": None,
             },
         )
     ]

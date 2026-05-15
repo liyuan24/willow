@@ -98,6 +98,8 @@ def _run_headless(args: argparse.Namespace) -> int:
         max_tokens=args.max_tokens,
         max_iterations=args.max_iterations,
         permission_mode=permission_mode,
+        thinking=bool(getattr(args, "thinking", False)),
+        effort=getattr(args, "effort", None),
     )
 
     if response.stop_reason == "tool_use":
@@ -199,6 +201,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Hard cap on assistant turns for the prompt (default: 20).",
     )
     parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="Enable provider reasoning controls for supported models.",
+    )
+    parser.add_argument(
+        "--effort",
+        choices=("low", "medium", "high", "xhigh", "max"),
+        default=None,
+        help="Reasoning effort to request when --thinking is enabled.",
+    )
+    parser.add_argument(
         "--resume",
         nargs="?",
         const="",
@@ -216,6 +229,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.effort is not None:
+        args.thinking = True
     if args.prompt is not None:
         return _run_headless(args)
     return _run_tui(args)
