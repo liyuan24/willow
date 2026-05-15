@@ -1675,6 +1675,129 @@ def test_live_up_and_down_arrows_navigate_input_history() -> None:
         os.close(write_fd)
 
 
+def test_live_split_arrow_escape_navigates_input_history() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.input_history = ["first prompt", "second prompt"]
+    read_fd, write_fd = os.pipe()
+    try:
+        live.fd = read_fd
+        os.write(write_fd, b"\x1b")
+        live._read_available_input()
+        assert live.pending_escape_sequence == "\x1b"
+        assert live.buffer == ""
+
+        os.write(write_fd, b"[A")
+        live._read_available_input()
+        assert live.pending_escape_sequence is None
+        assert live.buffer == "second prompt"
+        assert live.cursor == len("second prompt")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_live_split_csi_arrow_escape_navigates_input_history() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.input_history = ["first prompt", "second prompt"]
+    read_fd, write_fd = os.pipe()
+    try:
+        live.fd = read_fd
+        os.write(write_fd, b"\x1b[")
+        live._read_available_input()
+        assert live.pending_escape_sequence == "\x1b["
+        assert live.buffer == ""
+
+        os.write(write_fd, b"A")
+        live._read_available_input()
+        assert live.pending_escape_sequence is None
+        assert live.buffer == "second prompt"
+        assert live.cursor == len("second prompt")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    ["\x1b[13;2u", "\x1b[13;2~", "\x1b[27;2;13~"],
+)
+def test_live_shift_enter_inserts_newline_without_submitting(sequence: str) -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    read_fd, write_fd = os.pipe()
+    try:
+        live.fd = read_fd
+        os.write(write_fd, f"first{sequence}second".encode())
+        live._read_available_input()
+
+        assert live.buffer == "first\nsecond"
+        assert live.cursor == len("first\nsecond")
+        assert app.messages == []
+
+        out.seek(0)
+        out.truncate(0)
+        live._draw_prompt()
+        rendered = out.getvalue()
+        assert " > first" in rendered
+        assert "   second" in rendered
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_live_split_shift_enter_escape_inserts_newline() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    read_fd, write_fd = os.pipe()
+    try:
+        live.fd = read_fd
+        os.write(write_fd, b"first\x1b[13")
+        live._read_available_input()
+        assert live.pending_escape_sequence == "\x1b[13"
+        assert live.buffer == "first"
+
+        os.write(write_fd, b";2usecond")
+        live._read_available_input()
+        assert live.pending_escape_sequence is None
+        assert live.buffer == "first\nsecond"
+        assert live.cursor == len("first\nsecond")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_live_raw_terminal_enables_modified_key_reporting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    live = tui._LiveTerminal(app)
+    live.fd = 123
+    old_attrs = ["old"]
+    monkeypatch.setattr(tui.termios, "tcgetattr", lambda fd: old_attrs)
+    monkeypatch.setattr(tui.termios, "tcsetattr", lambda fd, when, attrs: None)
+    monkeypatch.setattr(tui.tty, "setcbreak", lambda fd: None)
+
+    with live._raw_terminal():
+        pass
+
+    rendered = out.getvalue()
+    assert "\x1b[>1u" in rendered
+    assert "\x1b[>4;2m" in rendered
+    assert "\x1b[<u" in rendered
+    assert "\x1b[>4m" in rendered
+
+
 def test_live_submit_records_prompt_for_input_history() -> None:
     out = _TTYBuffer()
     app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)

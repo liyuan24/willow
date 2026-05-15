@@ -105,6 +105,37 @@ LOGIN_PROVIDER_CHOICES: tuple[tuple[str, str], ...] = (
     ("openai-codex", "ChatGPT Plus/Pro Codex OAuth"),
 )
 PASTE_PLACEHOLDER_MIN_CHARS = 200
+ESCAPE_SEQUENCE_TIMEOUT_SECONDS = 0.05
+KEYBOARD_ENHANCEMENT_ENABLE = "\x1b[>1u\x1b[>4;2m"
+KEYBOARD_ENHANCEMENT_DISABLE = "\x1b[<u\x1b[>4m"
+SHIFT_ENTER_SEQUENCES = (
+    "\x1b[13;2u",
+    "\x1b[13;2~",
+    "\x1b[27;2;13~",
+)
+KNOWN_ESCAPE_SEQUENCES = (
+    "\x1b[200~",
+    "\x1b[201~",
+    *SHIFT_ENTER_SEQUENCES,
+    "\x1bb",
+    "\x1bB",
+    "\x1bf",
+    "\x1bF",
+    "\x1b[1;3D",
+    "\x1b[1;5D",
+    "\x1b[1;3C",
+    "\x1b[1;5C",
+    "\x1b[A",
+    "\x1bOA",
+    "\x1b[B",
+    "\x1bOB",
+    "\x1b[D",
+    "\x1b[C",
+    "\x1b[H",
+    "\x1b[1~",
+    "\x1b[F",
+    "\x1b[4~",
+)
 
 RESET = "\x1b[0m"
 DIM = "\x1b[2m"
@@ -386,6 +417,10 @@ def _render_input_hints(value: str, cwd: str | Path | None = None) -> str:
     return "\n".join(rows)
 
 
+def _is_incomplete_escape_sequence(text: str) -> bool:
+    return any(sequence != text and sequence.startswith(text) for sequence in KNOWN_ESCAPE_SEQUENCES)
+
+
 def _hint_command(row: str) -> str:
     return row.split(maxsplit=1)[0]
 
@@ -479,10 +514,21 @@ def _strip_control(text: str) -> str:
     return text.replace("\r", "\\r").replace("\n", "\\n")
 
 
+def _strip_prompt_control(text: str) -> str:
+    return text.replace("\r", "\\r")
+
+
 @dataclass(frozen=True)
 class _PromptInputRender:
     text: str
     cursor: int
+
+
+@dataclass(frozen=True)
+class _PromptInputLines:
+    lines: list[str]
+    cursor_line: int
+    cursor_column: int
 
 
 def _merge_pasted_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -525,7 +571,7 @@ def _render_prompt_input(
     buffer_length = len(buffer)
 
     def append_segment(segment: str) -> None:
-        display_parts.append(_strip_control(segment))
+        display_parts.append(_strip_prompt_control(segment))
 
     for start, end in _merge_pasted_ranges(pasted_ranges):
         start = max(0, min(start, buffer_length))
@@ -534,7 +580,7 @@ def _render_prompt_input(
             continue
         if cursor <= start and display_cursor is None:
             display_cursor = len("".join(display_parts)) + len(
-                _strip_control(buffer[position:cursor])
+                _strip_prompt_control(buffer[position:cursor])
             )
         append_segment(buffer[position:start])
         placeholder = f"[Pasted Content {end - start} chars]"
@@ -545,10 +591,44 @@ def _render_prompt_input(
 
     if display_cursor is None:
         display_cursor = len("".join(display_parts)) + len(
-            _strip_control(buffer[position:cursor])
+            _strip_prompt_control(buffer[position:cursor])
         )
     append_segment(buffer[position:])
     return _PromptInputRender(text="".join(display_parts), cursor=display_cursor)
+
+
+def _wrap_prompt_input(
+    preview: str,
+    cursor: int,
+    *,
+    first_width: int,
+    continuation_width: int,
+) -> _PromptInputLines:
+    lines = [""]
+    positions: list[tuple[int, int] | None] = [None] * (len(preview) + 1)
+
+    def current_width() -> int:
+        return first_width if len(lines) == 1 else continuation_width
+
+    for index, ch in enumerate(preview):
+        if ch != "\n" and len(lines[-1]) >= current_width():
+            lines.append("")
+        positions[index] = (len(lines) - 1, len(lines[-1]))
+        if ch == "\n":
+            lines.append("")
+        else:
+            lines[-1] += ch
+        positions[index + 1] = (len(lines) - 1, len(lines[-1]))
+
+    cursor = max(0, min(cursor, len(preview)))
+    cursor_position = positions[cursor]
+    if cursor_position is None:
+        cursor_position = (0, 0)
+    return _PromptInputLines(
+        lines=lines,
+        cursor_line=cursor_position[0],
+        cursor_column=cursor_position[1],
+    )
 
 
 def _display_cwd(path: Path | None = None) -> str:
@@ -1495,6 +1575,8 @@ class _LiveTerminal:
         self.prompt_cursor_line_index = 0
         self.prompt_cursor_offset_from_bottom = 0
         self.pending_paste_chunks: list[str] | None = None
+        self.pending_escape_sequence: str | None = None
+        self.pending_escape_started_at = 0.0
         self.pasted_ranges: list[tuple[int, int]] = []
         self.in_text = False
         self.in_thinking = False
@@ -1572,17 +1654,23 @@ class _LiveTerminal:
         old = termios.tcgetattr(self.fd)
         try:
             tty.setcbreak(self.fd)
-            self.app._write("\x1b[?2004h\x1b[6 q")
+            self.app._write(f"\x1b[?2004h{KEYBOARD_ENHANCEMENT_ENABLE}\x1b[6 q")
             yield
         finally:
-            self.app._write("\x1b[?2004l\x1b[0 q\x1b[0m\x1b[?25h")
+            self.app._write(
+                f"\x1b[?2004l{KEYBOARD_ENHANCEMENT_DISABLE}\x1b[0 q\x1b[0m\x1b[?25h"
+            )
             termios.tcsetattr(self.fd, termios.TCSADRAIN, old)
 
     def _read_available_input(self) -> None:
         readable, _, _ = select.select([self.fd], [], [], 0.03)
         if not readable:
+            self._flush_pending_escape_if_expired()
             return
         data = os.read(self.fd, 4096).decode(errors="ignore")
+        if self.pending_escape_sequence is not None:
+            data = self.pending_escape_sequence + data
+            self.pending_escape_sequence = None
         index = 0
         while index < len(data):
             if self.pending_paste_chunks is not None:
@@ -1629,7 +1717,24 @@ class _LiveTerminal:
                     self.cursor -= 1
                 self._draw_prompt()
             elif ch == "\x1b":
-                if data.startswith("b", index) or data.startswith("B", index):
+                candidate = data[index - 1 :]
+                if _is_incomplete_escape_sequence(candidate):
+                    self.pending_escape_sequence = candidate
+                    self.pending_escape_started_at = time.monotonic()
+                    return
+                shift_enter = next(
+                    (
+                        sequence
+                        for sequence in SHIFT_ENTER_SEQUENCES
+                        if data.startswith(sequence[1:], index)
+                    ),
+                    None,
+                )
+                if shift_enter is not None:
+                    self._insert_text("\n")
+                    index += len(shift_enter) - 1
+                    self._draw_prompt()
+                elif data.startswith("b", index) or data.startswith("B", index):
                     self._move_cursor_word_left()
                     index += 1
                     self._draw_prompt()
@@ -1680,6 +1785,17 @@ class _LiveTerminal:
             elif ch.isprintable():
                 self._insert_text(ch)
                 self._draw_prompt()
+
+    def _flush_pending_escape_if_expired(self) -> None:
+        pending = self.pending_escape_sequence
+        if pending is None:
+            return
+        elapsed = time.monotonic() - self.pending_escape_started_at
+        if elapsed < ESCAPE_SEQUENCE_TIMEOUT_SECONDS:
+            return
+        self.pending_escape_sequence = None
+        if pending == "\x1b" and self.streaming:
+            self._interrupt_with_buffer_if_possible()
 
     def _insert_text(self, text: str) -> None:
         self.buffer = self.buffer[: self.cursor] + text + self.buffer[self.cursor :]
@@ -2382,28 +2498,15 @@ class _LiveTerminal:
         continuation_prefix = " " * len(prefix)
         first_input_width = max(1, line_width - len(prefix))
         continuation_width = max(1, line_width - len(continuation_prefix))
-        if len(preview) <= first_input_width:
-            input_lines = [preview]
-            line_starts = [0]
-        else:
-            input_lines = [preview[:first_input_width]]
-            line_starts = [0]
-            for index in range(first_input_width, len(preview), continuation_width):
-                input_lines.append(preview[index : index + continuation_width])
-                line_starts.append(index)
-        if not input_lines:
-            input_lines = [""]
-            line_starts = [0]
-        cursor_line = 0
-        for line_index, (line, start) in enumerate(zip(input_lines, line_starts, strict=True)):
-            end = start + len(line)
-            if cursor < end or cursor == end and (
-                cursor == len(preview) or line_index == len(input_lines) - 1
-            ):
-                cursor_line = line_index
-                break
-            cursor_line = min(line_index + 1, len(input_lines) - 1)
-        cursor_column = cursor - line_starts[cursor_line]
+        wrapped_input = _wrap_prompt_input(
+            preview,
+            cursor,
+            first_width=first_input_width,
+            continuation_width=continuation_width,
+        )
+        input_lines = wrapped_input.lines
+        cursor_line = wrapped_input.cursor_line
+        cursor_column = wrapped_input.cursor_column
         if cursor_line == 0:
             cursor_column += len(prefix)
         else:
