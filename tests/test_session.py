@@ -80,9 +80,9 @@ def _sample_record() -> session.SessionRecord:
     )
 
 
-def test_session_record_round_trips_through_json_file(tmp_path: Path) -> None:
+def test_session_record_round_trips_through_jsonl_file(tmp_path: Path) -> None:
     record = _sample_record()
-    path = tmp_path / "nested" / "session.json"
+    path = tmp_path / "nested" / "session.jsonl"
 
     saved_path = session.save_session(record, path)
     loaded = session.load_session(saved_path)
@@ -94,10 +94,11 @@ def test_session_record_round_trips_through_json_file(tmp_path: Path) -> None:
     assert loaded.settings == record.settings
     assert loaded.messages == record.messages
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == session.SCHEMA_VERSION
-    assert raw["metadata"]["title"] == "debug run"
-    assert raw["settings"] == {
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["type"] == "session"
+    assert lines[0]["schema_version"] == session.SCHEMA_VERSION
+    assert lines[0]["metadata"]["title"] == "debug run"
+    assert lines[0]["settings"] == {
         "provider": "openai_responses",
         "model": "gpt-5.5",
         "system": "Be concise.",
@@ -106,16 +107,18 @@ def test_session_record_round_trips_through_json_file(tmp_path: Path) -> None:
         "thinking": False,
         "effort": None,
     }
-    assert raw["messages"][1]["content"][0] == {
+    assert lines[1]["type"] == "message"
+    assert lines[1]["message"]["role"] == "user"
+    assert lines[2]["message"]["content"][0] == {
         "type": "thinking",
         "thinking": "I should inspect the project first.",
         "signature": "sig_1",
         "encrypted_content": "enc_1",
     }
-    assert raw["messages"][3]["input_tokens"] == 100
-    assert raw["messages"][3]["output_tokens"] == 12
-    assert raw["messages"][3]["cached_tokens"] == 80
-    assert raw["messages"][3]["content"][0] == {
+    assert lines[4]["message"]["input_tokens"] == 100
+    assert lines[4]["message"]["output_tokens"] == 12
+    assert lines[4]["message"]["cached_tokens"] == 80
+    assert lines[4]["message"]["content"][0] == {
         "type": "redacted_thinking",
         "data": "opaque-redacted-payload",
     }
@@ -155,7 +158,7 @@ def test_save_session_replaces_existing_file_via_same_directory_temp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record = _sample_record()
-    path = tmp_path / "session.json"
+    path = tmp_path / "session.jsonl"
     path.write_text("old data", encoding="utf-8")
 
     calls: list[tuple[Path, Path]] = []
@@ -171,7 +174,8 @@ def test_save_session_replaces_existing_file_via_same_directory_temp(
         assert src_path.name.startswith(f".{path.name}.")
         assert src_path.name.endswith(".tmp")
         assert dst_path == path
-        assert json.loads(src_path.read_text(encoding="utf-8"))["metadata"]["id"] == "sess_123"
+        first_line = src_path.read_text(encoding="utf-8").splitlines()[0]
+        assert json.loads(first_line)["metadata"]["id"] == "sess_123"
         calls.append((src_path, dst_path))
         real_replace(src, dst)
 
@@ -191,7 +195,7 @@ def test_default_session_path_uses_env_override(
     monkeypatch.setenv(session.SESSION_DIR_ENV, str(tmp_path / "sessions"))
 
     assert session.default_session_dir() == tmp_path / "sessions"
-    assert session.default_session_path("abc-123") == tmp_path / "sessions" / "abc-123.json"
+    assert session.default_session_path("abc-123") == tmp_path / "sessions" / "abc-123.jsonl"
 
 
 def test_default_session_path_rejects_path_traversal() -> None:
@@ -223,16 +227,10 @@ def test_new_session_captures_settings_and_empty_history(tmp_path: Path) -> None
 
 
 def test_load_rejects_unknown_schema_version(tmp_path: Path) -> None:
-    path = tmp_path / "session.json"
+    path = tmp_path / "session.jsonl"
     path.write_text(
-        json.dumps(
-            {
-                "schema_version": 999,
-                "metadata": {},
-                "settings": {},
-                "messages": [],
-            }
-        ),
+        json.dumps({"type": "session", "schema_version": 999, "metadata": {}, "settings": {}})
+        + "\n",
         encoding="utf-8",
     )
 

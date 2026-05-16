@@ -25,6 +25,10 @@ def test_build_system_prompt_uses_willow_default_without_pi_docs(tmp_path: Path)
     assert "Pi documentation" not in prompt
     assert "- read:" in prompt
     assert "- bash:" in prompt
+    assert "Treat explicit task constraints as higher priority than convenient shortcuts" in prompt
+    assert "derive the task contract" in prompt
+    assert "assumptions that must be checked" in prompt
+    assert "validate heuristic constants or stopping conditions with repeatable evidence" in prompt
     assert "prefer using `rg` or `rg --files`" in prompt
     assert "Use tty=true only for commands that require an interactive terminal" in prompt
     assert "prefer conventional entrypoint names and process shapes" in prompt

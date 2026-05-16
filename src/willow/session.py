@@ -1,7 +1,7 @@
 """Durable Willow session records.
 
 This module intentionally stays independent from the CLI/TUI. It provides the
-JSON primitives needed for future resume support while keeping the saved files
+JSONL primitives needed for future resume support while keeping the saved files
 plain enough for users to inspect and edit by hand.
 """
 
@@ -116,19 +116,23 @@ def default_session_dir() -> Path:
 
 
 def default_session_path(session_id: str | None = None) -> Path:
-    """Return a JSON file path under :func:`default_session_dir`."""
+    """Return a JSONL file path under :func:`default_session_dir`."""
     sid = session_id or uuid.uuid4().hex
     if not _SESSION_ID_RE.fullmatch(sid):
         raise ValueError(
             "session_id may only contain letters, numbers, dots, underscores, and dashes"
         )
-    return default_session_dir() / f"{sid}.json"
+    return default_session_dir() / f"{sid}.jsonl"
 
 
 def resolve_session_path(selector: str) -> Path:
-    """Resolve a user-supplied session id or file path to a JSON path."""
+    """Resolve a user-supplied session id or file path to a session path."""
     candidate = Path(selector).expanduser()
-    if candidate.is_absolute() or candidate.parent != Path(".") or candidate.suffix == ".json":
+    if (
+        candidate.is_absolute()
+        or candidate.parent != Path(".")
+        or candidate.suffix == ".jsonl"
+    ):
         return candidate
     return default_session_path(selector)
 
@@ -140,7 +144,7 @@ def list_sessions(*, limit: int = 20) -> list[SessionEntry]:
         return []
 
     entries: list[SessionEntry] = []
-    for path in directory.glob("*.json"):
+    for path in directory.glob("*.jsonl"):
         try:
             record = load_session(path)
         except (OSError, ValueError, json.JSONDecodeError):
@@ -155,7 +159,7 @@ def list_sessions(*, limit: int = 20) -> list[SessionEntry]:
 
 
 def save_session(record: SessionRecord, path: str | Path | None = None) -> Path:
-    """Write ``record`` as JSON, replacing the target file atomically-ish.
+    """Write ``record`` as JSONL, replacing the target file atomically-ish.
 
     The data is written to a temporary file in the target directory, flushed and
     fsync'd, then moved into place with ``os.replace``. That gives readers either
@@ -168,8 +172,9 @@ def save_session(record: SessionRecord, path: str | Path | None = None) -> Path:
     temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temp.open("w", encoding="utf-8") as handle:
-            json.dump(session_to_dict(updated), handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
+            for line in session_to_jsonl_lines(updated):
+                handle.write(line)
+                handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, target)
@@ -181,11 +186,53 @@ def save_session(record: SessionRecord, path: str | Path | None = None) -> Path:
 
 
 def load_session(path: str | Path) -> SessionRecord:
-    """Read and validate a session JSON file."""
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("session file must contain a JSON object")
-    return session_from_dict(raw)
+    """Read and validate a session JSONL file."""
+    return session_from_jsonl_lines(Path(path).read_text(encoding="utf-8").splitlines())
+
+
+def session_to_jsonl_lines(record: SessionRecord) -> list[str]:
+    """Serialize a :class:`SessionRecord` to JSONL lines."""
+    header = {
+        "type": "session",
+        "schema_version": record.schema_version,
+        "metadata": metadata_to_dict(record.metadata),
+        "settings": settings_to_dict(record.settings),
+    }
+    return [
+        json.dumps(header, ensure_ascii=False, separators=(",", ":")),
+        *(
+            json.dumps(
+                {"type": "message", "message": message_to_dict(message)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for message in record.messages
+        ),
+    ]
+
+
+def session_from_jsonl_lines(lines: list[str]) -> SessionRecord:
+    """Deserialize a :class:`SessionRecord` from JSONL lines."""
+    objects = [json.loads(line) for line in lines if line.strip()]
+    if not objects:
+        raise ValueError("session JSONL file is empty")
+    header = objects[0]
+    if not isinstance(header, dict) or header.get("type") != "session":
+        raise ValueError("session JSONL must start with a session header")
+    version = header.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValueError(f"unsupported session schema_version: {version!r}")
+    messages: list[Message] = []
+    for index, item in enumerate(objects[1:], start=2):
+        if not isinstance(item, dict) or item.get("type") != "message":
+            raise ValueError(f"session JSONL line {index} must be a message object")
+        messages.append(message_from_dict(_require_dict(item, "message")))
+    return SessionRecord(
+        schema_version=version,
+        metadata=metadata_from_dict(_require_dict(header, "metadata")),
+        settings=settings_from_dict(_require_dict(header, "settings")),
+        messages=messages,
+    )
 
 
 def session_to_dict(record: SessionRecord) -> dict[str, Any]:

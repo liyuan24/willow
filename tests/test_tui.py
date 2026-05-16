@@ -6,6 +6,8 @@ import argparse
 import io
 import os
 import re
+import threading
+import time
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
@@ -60,6 +62,20 @@ class _ResettableScriptedStreamProvider(_ScriptedStreamProvider):
 
     def reset_conversation(self) -> None:
         self.reset_count += 1
+
+
+class _RaisingStreamProvider(Provider):
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.requests: list[CompletionRequest] = []
+
+    def complete(self, request: CompletionRequest) -> CompletionResponse:  # pragma: no cover
+        raise NotImplementedError
+
+    def stream(self, request: CompletionRequest) -> Iterator[Any]:
+        self.requests.append(request)
+        raise self.error
+        yield  # pragma: no cover
 
 
 class _RecordingTool(Tool):
@@ -117,6 +133,7 @@ def _make_args(**overrides: Any) -> argparse.Namespace:
         max_iterations=20,
         thinking=False,
         effort=None,
+        prompt=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -162,15 +179,31 @@ def _drive(
     return out.getvalue(), app
 
 
-def test_live_terminal_prefills_initial_prompt() -> None:
-    provider = _ScriptedStreamProvider([])
-    args = _make_args(initial_prompt="run this task")
-    app = tui.WillowApp(args, provider, input_func=input, out=io.StringIO())
+def test_basic_tui_submits_positional_prompt_before_reading_input() -> None:
+    response = CompletionResponse(content=[TextBlock(text="done")], stop_reason="end_turn")
+    provider = _ScriptedStreamProvider(
+        [[TextDelta(text="done"), StreamComplete(response=response)]]
+    )
 
-    terminal = tui._LiveTerminal(app)
+    out, app = _drive(provider, ["/exit"], args=_make_args(prompt="run this task"))
 
-    assert terminal.buffer == "run this task"
-    assert terminal.cursor == len("run this task")
+    assert len(provider.requests) == 1
+    assert provider.requests[0].messages[0].content == [TextBlock(text="run this task")]
+    assert [message.role for message in app.messages] == ["user", "assistant"]
+    assert "run this task" in out
+    assert "done" in out
+
+
+def test_basic_tui_provider_error_returns_to_prompt() -> None:
+    provider = _RaisingStreamProvider(RuntimeError("Codex error: policy warning"))
+
+    out, app = _drive(provider, ["run the task", "/exit"])
+
+    assert len(provider.requests) == 1
+    assert [message.role for message in app.messages] == ["user"]
+    assert "[error] Codex error: policy warning" in out
+    assert "RuntimeError(" not in out
+    assert "Goodbye." in out
 
 
 def _session_record(
@@ -316,7 +349,7 @@ def test_resumed_session_renders_saved_history_before_prompt() -> None:
     args.max_tokens = record.settings.max_tokens
     args.max_iterations = record.settings.max_iterations
     args._resume_session_record = record
-    args._resume_session_path = Path("/tmp/sess_resume.json")
+    args._resume_session_path = Path("/tmp/sess_resume.jsonl")
 
     inputs_iter = iter([])
 
@@ -359,7 +392,7 @@ def test_resumed_session_sends_saved_history_on_next_request() -> None:
     args.max_tokens = record.settings.max_tokens
     args.max_iterations = record.settings.max_iterations
     args._resume_session_record = record
-    args._resume_session_path = Path("/tmp/sess_resume.json")
+    args._resume_session_path = Path("/tmp/sess_resume.jsonl")
     response = CompletionResponse(content=[TextBlock(text="new answer")], stop_reason="end_turn")
     provider = _ScriptedStreamProvider([[StreamComplete(response=response)]])
     inputs_iter = iter(["new question", "/exit"])
@@ -422,7 +455,7 @@ def test_resumed_session_ending_with_tool_result_continues_turn(tmp_path: Path) 
     args.max_tokens = record.settings.max_tokens
     args.max_iterations = record.settings.max_iterations
     args._resume_session_record = record
-    args._resume_session_path = tmp_path / "sess_tool_result.json"
+    args._resume_session_path = tmp_path / "sess_tool_result.jsonl"
     response = CompletionResponse(content=[TextBlock(text="continued")], stop_reason="end_turn")
     provider = _ScriptedStreamProvider(
         [[TextDelta(text="continued"), StreamComplete(response=response)]]
@@ -457,11 +490,11 @@ def test_run_tui_resume_picker_uses_latest_session_when_not_interactive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     older = tui.SessionEntry(
-        path=Path("/tmp/older.json"),
+        path=Path("/tmp/older.jsonl"),
         record=_session_record("older", updated_at="2026-05-09T09:00:00Z"),
     )
     latest = tui.SessionEntry(
-        path=Path("/tmp/latest.json"),
+        path=Path("/tmp/latest.jsonl"),
         record=_session_record(
             "latest",
             provider="anthropic",
@@ -741,10 +774,24 @@ def test_running_terminal_line_animates_without_changing_text() -> None:
     assert first != second
     assert "\x1b[40;" in first
     assert "\x1b[40;38;5;51;1m" in bright
-    assert "\x1b[40;38;5;242m" in first
+    assert "\x1b[40;38;5;255m" in first
     assert "\x1b[48;5;238" not in first
     assert _strip_ansi(first) == " running bash - pytest".ljust(28)
     assert _strip_ansi(second) == " running bash - pytest".ljust(28)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "0s"),
+        (12, "12s"),
+        (75, "1m 15s"),
+        (3600, "1h"),
+        (3725, "1h 2m"),
+    ],
+)
+def test_format_elapsed_compact(seconds: int, expected: str) -> None:
+    assert tui._format_elapsed_compact(seconds) == expected
 
 
 def test_tool_running_title_collapses_multiline_bash_command() -> None:
@@ -775,18 +822,20 @@ def test_live_prompt_box_shows_working_when_streaming_without_input() -> None:
     app._force_plain = False
     live = tui._LiveTerminal(app)
     live.streaming = True
+    live.working_started_at = time.monotonic() - 12
 
     live._draw_prompt()
 
     rendered = out.getvalue()
-    assert tui.STATUS_STYLE in rendered
     assert tui.PROMPT_STYLE in rendered
-    assert "working..." in rendered
+    assert "\x1b[40;" in rendered
+    assert "\x1b[48;5;238" not in rendered[: rendered.index(tui.PROMPT_STYLE)]
+    assert "working... (12s, press esc to interrupt)" in _strip_ansi(rendered)
     assert " > " in rendered
-    assert live.prompt_lines == 5
+    assert live.prompt_lines == 7
     assert live.prompt_cursor_offset_from_bottom == 2
     assert "\r\x1b[3C\x1b[?25h" in rendered
-    assert rendered.index("working...") < rendered.index(tui.PROMPT_STYLE)
+    assert _strip_ansi(rendered).index("working...") < _strip_ansi(rendered).index(" > ")
     assert "streaming" not in rendered
     assert "ready" not in rendered
 
@@ -804,7 +853,7 @@ def test_live_active_tool_status_has_gap_before_input_box() -> None:
     rendered = _strip_ansi(out.getvalue())
     assert "running bash - pytest" in rendered
     assert "running bash - pytest" in rendered[: rendered.index(" > ")]
-    assert live.prompt_lines == 6
+    assert live.prompt_lines == 7
     assert live.prompt_cursor_offset_from_bottom == 2
 
 
@@ -842,8 +891,9 @@ def test_live_prompt_box_switches_to_type_box_when_streaming_with_input() -> Non
     rendered = out.getvalue()
     assert " > queued text" in rendered
     assert "\r\x1b[14C\x1b[?25h" in rendered
-    assert "working..." in rendered
-    assert rendered.index("working...") < rendered.index(" > queued text")
+    visible = _strip_ansi(rendered)
+    assert "working..." in visible
+    assert visible.index("working...") < visible.index(" > queued text")
 
 
 def test_live_prompt_cursor_overlays_character_without_shifting_text() -> None:
@@ -1361,6 +1411,32 @@ def test_live_stream_chunk_keeps_prompt_stable_until_completion() -> None:
     rendered = out.getvalue()
     assert "Hello" in rendered
     assert " > " in rendered
+
+
+def test_live_provider_error_flushes_partial_output_and_keeps_prompt_usable() -> None:
+    out = _TTYBuffer()
+    app = tui.WillowApp(_make_args(), _ScriptedStreamProvider([]), out=out)
+    app._force_plain = False
+    live = tui._LiveTerminal(app)
+    live.active_turn_id = 3
+    live.streaming = True
+    live.worker = threading.Thread(target=lambda: None)
+    live.active_tool_status = "running bash - pytest"
+
+    live.events.put((3, "stream", TextDelta(text="partial output")))
+    live.events.put((3, "error", RuntimeError("Codex error: policy warning")))
+    live._drain_events()
+
+    rendered = out.getvalue()
+    assert "partial output" in rendered
+    visible = _strip_ansi(rendered)
+    assert "error" in visible
+    assert "Codex error: policy warning" in visible
+    assert "RuntimeError(" not in rendered
+    assert " > " in rendered
+    assert live.streaming is False
+    assert live.worker is None
+    assert live.active_tool_status is None
 
 
 def test_live_prompt_shows_queued_messages_with_interrupt_hint() -> None:
@@ -2145,6 +2221,76 @@ def test_terminal_tool_error_renders_tool_name_state_and_clean_error(
     assert "● explode error" in out
     assert "ValueError: bad input" in out
     assert "ValueError('bad input')" not in out
+
+
+def test_tui_persists_tool_use_before_tool_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(session.SESSION_DIR_ENV, str(tmp_path / "sessions"))
+    app_box: dict[str, tui.WillowApp] = {}
+    saw_persisted_tool_use = False
+
+    class InspectingTool(Tool):
+        name = "inspect_persisted_tool_use"
+        description = "Inspect the saved session while the tool is running."
+        input_schema = {"type": "object", "properties": {}}
+
+        def run(self, **_kwargs: Any) -> str:
+            nonlocal saw_persisted_tool_use
+            app = app_box["app"]
+            assert app._session_path is not None
+            saved = session.load_session(app._session_path)
+            last = saved.messages[-1]
+            saw_persisted_tool_use = (
+                last.role == "assistant"
+                and len(last.content) == 1
+                and isinstance(last.content[0], ToolUseBlock)
+                and last.content[0].name == self.name
+            )
+            return "ok"
+
+    monkeypatch.setitem(TOOLS_BY_NAME, "inspect_persisted_tool_use", InspectingTool())
+    tool_use_response = CompletionResponse(
+        content=[ToolUseBlock(id="call_1", name="inspect_persisted_tool_use", input={})],
+        stop_reason="tool_use",
+    )
+    end_response = CompletionResponse(content=[TextBlock(text="done")], stop_reason="end_turn")
+    provider = _ScriptedStreamProvider(
+        [
+            [StreamComplete(response=tool_use_response)],
+            [StreamComplete(response=end_response)],
+        ]
+    )
+    inputs = iter(["use tool", "/exit"])
+
+    def input_func(_prompt: str = "") -> str:
+        try:
+            return next(inputs)
+        except StopIteration as exc:
+            raise EOFError from exc
+
+    app = tui.WillowApp(
+        _make_args(persist_session=True),
+        provider,
+        input_func=input_func,
+        out=io.StringIO(),
+    )
+    app_box["app"] = app
+
+    assert app.run() == 0
+
+    assert saw_persisted_tool_use is True
+    assert app._session_path is not None
+    saved = session.load_session(app._session_path)
+    assert [message.role for message in saved.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert isinstance(saved.messages[1].content[0], ToolUseBlock)
+    assert isinstance(saved.messages[2].content[0], ToolResultBlock)
 
 
 def test_edit_tool_result_renders_diff_review_style() -> None:

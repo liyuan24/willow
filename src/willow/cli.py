@@ -3,9 +3,11 @@
 Default usage mirrors coding-agent CLIs:
 
     willow
+    willow "follow this prompt"
     willow -p "follow this prompt"
 
-Running without ``-p/--print`` opens the native terminal UI. Running with
+Running without ``-p/--print`` opens the native terminal UI. A positional
+prompt is submitted as the first interactive user message. Running with
 ``-p/--print`` executes one prompt headlessly and prints only the final
 assistant text.
 """
@@ -94,7 +96,7 @@ def _run_headless(args: argparse.Namespace) -> int:
     response = run_agent(
         args.provider,
         args.model,
-        args.prompt,
+        args.print_prompt,
         max_tokens=args.max_tokens,
         max_iterations=args.max_iterations,
         permission_mode=permission_mode,
@@ -167,15 +169,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-p",
         "--print",
-        dest="prompt",
+        dest="print_prompt",
         metavar="PROMPT",
         default=None,
         help="Run one prompt headlessly and print the final response.",
     )
     parser.add_argument(
-        "--initial-prompt",
+        "prompt",
+        nargs="?",
         default=None,
-        help="Initial prompt to prefill when opening the interactive TUI.",
+        help="Prompt to submit as the first message in the interactive TUI.",
     )
     parser.add_argument(
         "--provider",
@@ -218,7 +221,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SESSION",
         help=(
-            "Resume a saved TUI session. With SESSION, use that session id or JSON path; "
+            "Resume a saved TUI session. With SESSION, use that session id or JSONL path; "
             "without SESSION, choose from recent sessions."
         ),
     )
@@ -229,9 +232,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.print_prompt is not None and args.prompt is not None:
+        parser.error("positional prompt cannot be used with -p/--print")
     if args.effort is not None:
         args.thinking = True
-    if args.prompt is not None:
+    if args.print_prompt is not None:
         return _run_headless(args)
     return _run_tui(args)
 

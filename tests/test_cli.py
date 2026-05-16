@@ -24,7 +24,7 @@ def test_build_parser_defaults_to_tui_settings() -> None:
     assert args.max_iterations == 20
     assert args.thinking is False
     assert args.effort is None
-    assert args.initial_prompt is None
+    assert args.print_prompt is None
     assert args.resume is None
     assert args.permission_mode == cli.PermissionMode.YOLO
 
@@ -50,7 +50,8 @@ def test_build_parser_print_mode_accepts_prompt_and_shared_flags() -> None:
         ]
     )
 
-    assert args.prompt == "follow the prompt"
+    assert args.print_prompt == "follow the prompt"
+    assert args.prompt is None
     assert args.provider == "anthropic"
     assert args.model == "claude-sonnet-4-6"
     assert args.max_tokens == 512
@@ -70,23 +71,24 @@ def test_build_parser_resume_accepts_optional_session() -> None:
     assert direct_args.resume == "sess_123"
 
 
-def test_build_parser_accepts_initial_prompt_for_tui() -> None:
+def test_build_parser_accepts_positional_prompt_for_tui() -> None:
     parser = cli._build_parser()
-    args = parser.parse_args(["--initial-prompt", "do the task"])
+    args = parser.parse_args(["do the task"])
 
-    assert args.initial_prompt == "do the task"
-    assert args.prompt is None
+    assert args.prompt == "do the task"
+    assert args.print_prompt is None
 
 
-def test_build_parser_rejects_removed_subcommands() -> None:
+def test_build_parser_rejects_extra_positionals() -> None:
     parser = cli._build_parser()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["chat"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["tui"])
     with pytest.raises(SystemExit):
         parser.parse_args(["headless", "prompt"])
+
+
+def test_main_rejects_print_prompt_with_positional_prompt() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["-p", "headless", "interactive"])
 
 
 def test_build_parser_permission_modes_are_mutually_exclusive() -> None:
@@ -117,7 +119,7 @@ def test_main_without_prompt_runs_tui(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[0].prompt is None
 
 
-def test_main_with_prompt_runs_headless(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_with_print_prompt_runs_headless(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[argparse.Namespace] = []
 
     def fake_run_headless(args: argparse.Namespace) -> int:
@@ -128,6 +130,21 @@ def test_main_with_prompt_runs_headless(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(cli, "_run_headless", fake_run_headless)
 
     assert cli.main(["-p", "follow the prompt"]) == 7
+    assert len(calls) == 1
+    assert calls[0].print_prompt == "follow the prompt"
+
+
+def test_main_with_positional_prompt_runs_tui(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[argparse.Namespace] = []
+
+    def fake_run_tui(args: argparse.Namespace) -> int:
+        calls.append(args)
+        return 42
+
+    monkeypatch.setattr(cli, "_run_tui", fake_run_tui)
+    monkeypatch.setattr(cli, "_run_headless", lambda _args: pytest.fail("headless called"))
+
+    assert cli.main(["follow the prompt"]) == 42
     assert len(calls) == 1
     assert calls[0].prompt == "follow the prompt"
 
@@ -156,7 +173,8 @@ def test_headless_calls_run_agent_and_prints_final_text(
             max_tokens=512,
             max_iterations=3,
             permission_mode=cli.PermissionMode.READ_ONLY,
-            prompt="follow the prompt",
+            print_prompt="follow the prompt",
+            prompt=None,
         )
     )
 
@@ -197,7 +215,8 @@ def test_headless_returns_nonzero_if_tools_remain_pending(
             max_tokens=4096,
             max_iterations=1,
             permission_mode=cli.PermissionMode.YOLO,
-            prompt="use a tool",
+            print_prompt="use a tool",
+            prompt=None,
         )
     )
 
@@ -217,7 +236,8 @@ def test_headless_rejects_ask_for_permission(monkeypatch: pytest.MonkeyPatch) ->
             max_tokens=4096,
             max_iterations=1,
             permission_mode=cli.PermissionMode.ASK,
-            prompt="use a tool",
+            print_prompt="use a tool",
+            prompt=None,
         )
     )
 

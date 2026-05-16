@@ -19,6 +19,7 @@ from .utils.output import externalize_large_output
 
 class BashTool(Tool):
     MAX_TIMEOUT_SECONDS = 600.0
+    PIPE_DRAIN_TIMEOUT_SECONDS = 1.0
 
     name = "bash"
     description = (
@@ -90,12 +91,34 @@ class BashTool(Tool):
         )
         try:
             stdout, stderr = process.communicate(timeout=clamped_timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as timeout_error:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
+            capture_incomplete = False
+            try:
+                stdout, stderr = process.communicate(timeout=self.PIPE_DRAIN_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as drain_error:
+                capture_incomplete = True
+                stdout = _timeout_output(drain_error.output) or _timeout_output(
+                    timeout_error.output
+                )
+                stderr = _timeout_output(drain_error.stderr) or _timeout_output(
+                    timeout_error.stderr
+                )
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        with suppress(OSError):
+                            pipe.close()
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.1)
             elapsed = time.monotonic() - started_at
             parts = [f"[timeout after {clamped_timeout:g}s; elapsed {elapsed:.2f}s]"]
+            if capture_incomplete:
+                parts.append(
+                    "[output capture stopped: descendant process kept stdout/stderr open]"
+                )
             if stdout:
                 parts.append(stdout.rstrip("\n"))
             if stderr:
@@ -273,6 +296,14 @@ def _read_pty(fd: int) -> bytes:
         if exc.errno == errno.EIO:
             return b""
         raise
+
+
+def _timeout_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
 
 
 def _copy_pty_to_log(master_fd: int, process: subprocess.Popen[bytes], log_file) -> None:

@@ -89,7 +89,20 @@ def _guidelines(
     permission_mode: PermissionMode,
 ) -> list[str]:
     names = set(tools_by_name)
-    guidelines: list[str] = []
+    guidelines: list[str] = [
+        "Treat explicit task constraints as higher priority than convenient "
+        "shortcuts. Before acting, identify required and forbidden methods, "
+        "allowed interfaces, required output paths, and evaluation conditions. "
+        "Do not use an easier path that violates those constraints, even if it "
+        "is available in the environment.",
+        "Before running tools or writing code for a nontrivial task, derive the "
+        "task contract: goal, constraints, allowed inputs or interfaces, "
+        "forbidden shortcuts, required outputs, validation method, and "
+        "assumptions that must be checked. Keep subsequent actions consistent "
+        "with that contract, and validate heuristic constants or stopping "
+        "conditions with repeatable evidence instead of a single successful "
+        "trial.",
+    ]
 
     if "bash" in names:
         guidelines.append(

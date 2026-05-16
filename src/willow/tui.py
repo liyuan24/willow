@@ -49,6 +49,7 @@ from willow.permissions import (
 )
 from willow.providers import (
     CompletionResponse,
+    ContentBlock,
     Message,
     Provider,
     StreamComplete,
@@ -676,6 +677,31 @@ def _history_ends_with_tool_results(messages: list[Message]) -> bool:
     )
 
 
+def _assistant_message(response: CompletionResponse) -> Message:
+    return Message(
+        role="assistant",
+        content=list(response.content),
+        input_tokens=response.usage.get("input_tokens", 0),
+        output_tokens=response.usage.get("output_tokens", 0),
+        cached_tokens=_cached_tokens_from_usage(response.usage),
+    )
+
+
+def _cached_tokens_from_usage(usage: dict[str, int]) -> int:
+    for key in ("cached_tokens", "cache_read_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def _turn_error_text(error: BaseException) -> str:
+    text = str(error).strip()
+    if text:
+        return text
+    return type(error).__name__
+
+
 def _input_history_from_messages(messages: list[Message]) -> list[str]:
     history: list[str] = []
     for message in messages:
@@ -731,9 +757,9 @@ def _running_terminal_line(text: str, width: int, *, frame: int) -> str:
         elif distance <= 3:
             style = "\x1b[40;38;5;159m"
         elif distance <= 5:
-            style = "\x1b[40;38;5;250m"
+            style = "\x1b[40;38;5;251m"
         else:
-            style = "\x1b[40;38;5;242m"
+            style = "\x1b[40;38;5;255m"
         parts.append(f"{style}{char}")
     parts.append(f"{RESET}\x1b[?7h")
     return "".join(parts)
@@ -742,6 +768,19 @@ def _running_terminal_line(text: str, width: int, *, frame: int) -> str:
 def _black_terminal_line(text: str, width: int) -> str:
     visible_width = _terminal_line_width(width)
     return f"\x1b[?7l\x1b[40;38;5;255m{text[:visible_width].ljust(visible_width)}{RESET}\x1b[?7h"
+
+
+def _format_elapsed_compact(seconds: int) -> str:
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {remaining_seconds}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if remaining_minutes == 0:
+        return f"{hours}h"
+    return f"{hours}h {remaining_minutes}m"
 
 
 class WillowApp:
@@ -836,6 +875,10 @@ class WillowApp:
         self._write_welcome_card()
         self._write_resume_history_if_pending()
         self._continue_resumed_turn_if_needed()
+        positional_prompt = self._positional_prompt_text()
+        if positional_prompt:
+            self._submit_user_text(positional_prompt, render=True)
+            self._run_turn_recovering()
         while True:
             try:
                 user_input = self.input_func(self._prompt())
@@ -849,21 +892,29 @@ class WillowApp:
             text = user_input.strip()
             if not text:
                 continue
-            expanded_text = self._expand_skill_text(text)
-            if expanded_text is None and text.startswith("/"):
+            if self._expand_skill_text(text) is None and text.startswith("/"):
                 if self._handle_slash(text):
                     break
                 continue
 
-            self._write_block(text, USER_STYLE)
-            self.messages.append(
-                Message(role="user", content=[TextBlock(text=expanded_text or text)])
-            )
-            self._persist_session()
-            self._run_turn()
+            self._submit_user_text(text, render=True)
+            self._run_turn_recovering()
 
         self._write_line("Goodbye.")
         return 0
+
+    def _positional_prompt_text(self) -> str:
+        prompt = getattr(self.args, "prompt", None)
+        return prompt.strip() if isinstance(prompt, str) else ""
+
+    def _submit_user_text(self, text: str, *, render: bool) -> None:
+        expanded_text = self._expand_skill_text(text)
+        if render:
+            self._write_block(text, USER_STYLE)
+        self.messages.append(
+            Message(role="user", content=[TextBlock(text=expanded_text or text)])
+        )
+        self._persist_session()
 
     def _can_run_live(self) -> bool:
         return (
@@ -944,16 +995,25 @@ class WillowApp:
             has_tool_uses = any(isinstance(block, ToolUseBlock) for block in response.content)
             if has_tool_uses:
                 self._write_separator()
-            tool_results = (
-                self._dispatch_tools(response)
-                if response.stop_reason == "tool_use"
-                else []
-            )
+                self._append_assistant_response(response)
+                tool_results = (
+                    self._dispatch_tools(response)
+                    if response.stop_reason == "tool_use"
+                    else []
+                )
+                monitor_events = self.runtime.events.drain()
+                pending_monitor = monitor_event_text_blocks(monitor_events)
+                if self._append_followup_user([*tool_results, *pending_monitor]):
+                    if tool_results:
+                        self._write_separator()
+                    continue
+                self._write_status_snapshot()
+                return
+
             monitor_events = self.runtime.events.drain()
             pending_monitor = monitor_event_text_blocks(monitor_events)
             step = build_turn_step(
                 response,
-                tool_results=tool_results,
                 pending_user_blocks=pending_monitor,
             )
             append_turn_step(self.messages, step)
@@ -961,11 +1021,30 @@ class WillowApp:
             if not step.continue_running:
                 self._write_status_snapshot()
                 return
-            if tool_results:
-                self._write_separator()
 
         self._write_line(f"[hit max_iterations={self.max_iterations}; returning control]")
         self._write_status_snapshot()
+
+    def _run_turn_recovering(self) -> None:
+        try:
+            self._run_turn()
+        except Exception as exc:  # noqa: BLE001
+            self._write_turn_error(exc)
+
+    def _write_turn_error(self, error: BaseException) -> None:
+        self._write_panel("error", _turn_error_text(error), ERROR_STYLE)
+        self._write_status_snapshot()
+
+    def _append_assistant_response(self, response: CompletionResponse) -> None:
+        self.messages.append(_assistant_message(response))
+        self._persist_session()
+
+    def _append_followup_user(self, content: list[ContentBlock]) -> bool:
+        if not content:
+            return False
+        self.messages.append(Message(role="user", content=content))
+        self._persist_session()
+        return True
 
     def _request_preparer(
         self,
@@ -1570,6 +1649,7 @@ class _LiveTerminal:
         self.compacting = False
         self._last_compaction_frame_at = 0.0
         self._last_running_frame_at = 0.0
+        self.working_started_at: float | None = None
         self.prompt_lines = 0
         self.prompt_width = 0
         self.prompt_cursor_line_index = 0
@@ -1595,12 +1675,6 @@ class _LiveTerminal:
         self.input_history = _input_history_from_messages(self.app.messages)
         self.input_history_index: int | None = None
         self.input_history_draft = ""
-        initial_prompt = getattr(self.app.args, "initial_prompt", None)
-        if isinstance(initial_prompt, str) and initial_prompt:
-            self.buffer = initial_prompt
-            self.cursor = len(initial_prompt)
-            if len(initial_prompt) >= PASTE_PLACEHOLDER_MIN_CHARS or "\n" in initial_prompt:
-                self.pasted_ranges = [(0, len(initial_prompt))]
 
     def run(self) -> int:
         self.app._write_welcome_card()
@@ -1613,6 +1687,11 @@ class _LiveTerminal:
                     STATUS_STYLE,
                 )
                 self._start_worker()
+            else:
+                positional_prompt = self.app._positional_prompt_text()
+                if positional_prompt:
+                    self.app._submit_user_text(positional_prompt, render=True)
+                    self._start_worker()
             self._draw_prompt()
             try:
                 while self.running:
@@ -1625,9 +1704,8 @@ class _LiveTerminal:
                     if should_animate:
                         self._last_compaction_frame_at = time.monotonic()
                         self._draw_prompt()
-                    should_animate_running = (
-                        self.active_tool_status is not None
-                        and time.monotonic() - self._last_running_frame_at >= 0.04
+                    should_animate_running = self._running_status_active() and (
+                        time.monotonic() - self._last_running_frame_at >= 0.04
                     )
                     if should_animate_running:
                         self._last_running_frame_at = time.monotonic()
@@ -2135,6 +2213,7 @@ class _LiveTerminal:
         self.streaming = False
         self.compacting = False
         self.active_tool_status = None
+        self.working_started_at = None
         self.app._write_panel(
             "status",
             "Interrupted current turn; it will be sent again with your next message.",
@@ -2227,6 +2306,7 @@ class _LiveTerminal:
 
     def _start_worker(self) -> None:
         self.streaming = True
+        self.working_started_at = time.monotonic()
         self.active_turn_id += 1
         self.in_text = False
         self.in_thinking = False
@@ -2276,12 +2356,17 @@ class _LiveTerminal:
                 self._render_stream_event(payload)
             elif kind == "complete":
                 self._clear_prompt()
+                self.worker = None
                 self._finish_response(cast(CompletionResponse, payload))
             elif kind == "error":
                 self._clear_prompt()
-                self.app._write_panel("error", repr(payload), ERROR_STYLE)
+                self._flush_stream_buffer()
+                self.app._write_turn_error(cast(BaseException, payload))
                 self.streaming = False
                 self.compacting = False
+                self.worker = None
+                self.active_tool_status = None
+                self.working_started_at = None
             elif kind == "compact_start":
                 self.compacting = True
                 self._last_compaction_frame_at = 0.0
@@ -2322,12 +2407,15 @@ class _LiveTerminal:
         has_tool_uses = any(isinstance(block, ToolUseBlock) for block in response.content)
         if has_tool_uses:
             self.app._write_separator()
+            self.app._append_assistant_response(response)
         tool_results = (
             self._dispatch_tools_with_prompt(response)
             if response.stop_reason == "tool_use"
             else []
         )
         if not self.streaming:
+            if has_tool_uses and tool_results:
+                self.app._append_followup_user(list(tool_results))
             return
         interrupted_texts = self.interrupted_user_inputs
         pending_texts = self.pending_user_inputs
@@ -2345,19 +2433,24 @@ class _LiveTerminal:
         self.interrupted_user_inputs = []
         self.pending_user_inputs = []
         self.pending_monitor_inputs = []
-        step = build_turn_step(
-            response,
-            tool_results=tool_results,
-            pending_user_blocks=pending,
-        )
-        append_turn_step(self.app.messages, step)
-        self.app._persist_session()
-        if step.continue_running:
+        if has_tool_uses:
+            followup_content = [*tool_results, *pending]
+            continue_running = self.app._append_followup_user(followup_content)
+        else:
+            step = build_turn_step(
+                response,
+                pending_user_blocks=pending,
+            )
+            append_turn_step(self.app.messages, step)
+            self.app._persist_session()
+            continue_running = step.continue_running
+        if continue_running:
             if tool_results:
                 self.app._write_separator()
             self._start_worker()
         else:
             self.streaming = False
+            self.working_started_at = None
             self.app._write_status_snapshot()
 
     def _dispatch_tools_with_prompt(
@@ -2472,7 +2565,7 @@ class _LiveTerminal:
         elif self.streaming:
             parts.append(f"{self._running_status_line(width)}\n")
             prompt_lines += 1
-            if self.active_tool_status is not None:
+            for _ in range(2):
                 parts.append(f"{_black_terminal_line('', width)}\n")
                 prompt_lines += 1
         if self.interrupted_user_inputs:
@@ -2572,14 +2665,23 @@ class _LiveTerminal:
         self.app._write("".join(parts))
 
     def _running_status_line(self, width: int) -> str:
-        running_text = self.active_tool_status or "working..."
-        if self.active_tool_status is not None and self.app._styles_enabled():
+        running_text = self.active_tool_status or self._working_status_text()
+        if self.app._styles_enabled():
             frame = int(time.monotonic() * 48)
             return _running_terminal_line(f" {running_text}", width, frame=frame)
-        return _styled_terminal_line(f" {running_text}", STATUS_STYLE, width)
+        return _black_terminal_line(f" {running_text}", width)
+
+    def _working_status_text(self) -> str:
+        started_at = self.working_started_at or time.monotonic()
+        elapsed_seconds = max(0, int(time.monotonic() - started_at))
+        elapsed = _format_elapsed_compact(elapsed_seconds)
+        return f"working... ({elapsed}, press esc to interrupt)"
+
+    def _running_status_active(self) -> bool:
+        return self.streaming and not self.compacting
 
     def _redraw_running_status_line(self) -> None:
-        if self.active_tool_status is None or self.prompt_lines == 0:
+        if not self._running_status_active() or self.prompt_lines == 0:
             return
         width = self.app._terminal_width()
         parts = ["\x1b7\x1b[?25l"]

@@ -62,7 +62,7 @@ def test_foreground_timeout_clamps_and_kills_process_group(monkeypatch, tmp_path
 
         def communicate(self, timeout=None):
             communicate_timeouts.append(timeout)
-            if timeout is not None:
+            if timeout == 600.0:
                 raise subprocess.TimeoutExpired(cmd="sleep forever", timeout=timeout)
             self.returncode = -9
             return "", ""
@@ -73,8 +73,29 @@ def test_foreground_timeout_clamps_and_kills_process_group(monkeypatch, tmp_path
     output = BashTool(cwd=tmp_path).run("sleep forever", timeout=999)
 
     assert communicate_timeouts[0] == 600.0
+    assert communicate_timeouts[1] == BashTool.PIPE_DRAIN_TIMEOUT_SECONDS
     assert killed_pgids == [12345]
     assert "[timeout after 600s;" in output
+
+
+def test_foreground_timeout_returns_when_descendant_keeps_pipe_open(tmp_path: Path) -> None:
+    tool = BashTool(cwd=tmp_path)
+    command = _python_command(
+        "import subprocess, sys, time; "
+        "subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(3)'], "
+        "stdout=sys.stdout, stderr=sys.stderr, start_new_session=True"
+        "); "
+        "time.sleep(30)"
+    )
+
+    started_at = time.monotonic()
+    output = tool.run(command, timeout=0.1)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 2.0
+    assert "[timeout after 0.1s;" in output
+    assert "descendant process kept stdout/stderr open" in output
 
 
 def test_foreground_tty_allocates_terminal(tmp_path: Path) -> None:
